@@ -22,7 +22,8 @@ python -u train_species.py --name oak --steps 2000 --device cpu
 
 # View a trained species (requires pygame)
 python run_simulation.py oak
-python run_simulation.py oak pine fern   # side-by-side
+python run_simulation.py oak pine fern       # side-by-side (positional)
+python run_simulation.py --species oak pine  # equivalent --species flag
 
 # Train and immediately launch viewer
 python -u train_species.py --name oak --preset oak --steps 5000 --preview

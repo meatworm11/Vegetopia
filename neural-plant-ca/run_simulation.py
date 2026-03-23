@@ -218,10 +218,21 @@ def run_viewer(species_names: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    names = sys.argv[1:]
+    import argparse
+    parser = argparse.ArgumentParser(description='Vegetopia NCA viewer')
+    parser.add_argument(
+        'species', nargs='*',
+        help='Species name(s) to display',
+    )
+    parser.add_argument(
+        '--species', dest='species_flag', nargs='+', metavar='NAME',
+        help='Species name(s) to display (alternative to positional args)',
+    )
+    args = parser.parse_args()
+
+    names = args.species_flag or args.species
     if not names:
-        print(__doc__)
-        print("Usage: python run_simulation.py <species_name> [<species_name> ...]")
+        parser.print_help()
         sys.exit(1)
 
     run_viewer(names)

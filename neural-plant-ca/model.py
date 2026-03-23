@@ -51,8 +51,8 @@ class Perception(nn.Module):
         ]).view(1, 1, 3, 3) / 8.0
 
         # Expand to depthwise kernels: (n_channels, 1, 3, 3)
-        self.register_buffer('sobel_x', sobel_x.expand(n_channels, -1, -1, -1))
-        self.register_buffer('sobel_y', sobel_y.expand(n_channels, -1, -1, -1))
+        self.register_buffer('sobel_x', sobel_x.expand(n_channels, -1, -1, -1).clone())
+        self.register_buffer('sobel_y', sobel_y.expand(n_channels, -1, -1, -1).clone())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Circular padding so grid wraps (prevents edge artifacts)
