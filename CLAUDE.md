@@ -14,8 +14,8 @@ All code lives in `neural-plant-ca/`. Run all commands from that directory.
 cd neural-plant-ca
 
 # Train a species (outputs to species/ and snapshots/)
-python -u train_species.py --name oak --preset oak --steps 5000
-python -u train_species.py --name pine --preset pine --steps 5000 --seed 7
+python -u train_species.py --name oak --preset oak --steps 10000
+python -u train_species.py --name pine --preset pine --steps 10000 --seed 7
 
 # Quick smoke test (fast, CPU, few steps)
 python -u train_species.py --name oak --steps 2000 --device cpu
@@ -26,7 +26,7 @@ python run_simulation.py oak pine fern       # side-by-side (positional)
 python run_simulation.py --species oak pine  # equivalent --species flag
 
 # Train and immediately launch viewer
-python -u train_species.py --name oak --preset oak --steps 5000 --preview
+python -u train_species.py --name oak --preset oak --steps 10000 --preview
 
 # Smoke-test the model module directly
 python model.py
@@ -51,9 +51,9 @@ Use `python -u` when piping output (e.g. to `tee`), otherwise Python buffers std
 - `6-11`: water, integrity, age, cell_type, species_id, reserved
 - `12-31`: learned hidden state
 
-**NCA forward pass** (`model.py`): fixed Sobel perception (32→96 channels) → two 1×1 convs (96→128→32) → stochastic fire mask → living cell mask → env channel restoration. The final conv layer is zero-initialized so training starts from a no-op.
+**NCA forward pass** (`model.py`): fixed Sobel perception (32→96 channels) → two 1×1 convs (96→128→32) → stochastic fire mask → living cell mask → hard alpha clamp (all channels zeroed where alpha < 0.1) → env channel restoration. The final conv layer is zero-initialized so training starts from a no-op.
 
-**Training loop** (`training.py`): pool-based strategy (pool of 1024 states). Each step: sample a batch of 8, replace the worst sample with a fresh seed, unroll the NCA for 64–96 random steps, backprop with per-parameter gradient normalization (prevents exploding gradients through long unrolls). Loss = MSE on RGBA + 0.1×cell-type MSE + 0.01×hidden channel overflow penalty.
+**Training loop** (`training.py`): pool-based strategy (pool of 1024 states). Each step: sample a batch of 8, replace the worst sample with a fresh seed, unroll the NCA for 80–128 random steps, backprop with per-parameter gradient normalization (prevents exploding gradients through long unrolls). Loss = MSE on RGBA + 0.1×cell-type MSE + 0.01×hidden overflow + 2.0×background loss (penalises alpha outside target mask).
 
 **Targets** (`target.py`): procedurally generated per-preset trees with small random perturbations each run (`perturb_height`, `perturb_radius`). Presets: `oak`, `pine`, `fern`, `bush`.
 

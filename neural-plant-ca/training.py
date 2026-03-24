@@ -34,9 +34,9 @@ from model import NCA, make_seed
 def _compute_loss(
     output: torch.Tensor,
     target: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Return (total_loss, shape_loss, type_loss, overflow_loss).
+    Return (total_loss, shape_loss, type_loss, overflow_loss, bg_loss).
 
     target shape: (N_CHANNELS, H, W) — broadcast over batch automatically.
     """
@@ -55,8 +55,12 @@ def _compute_loss(
 
     overflow = (output[:, 12:].abs() - 5).clamp(min=0).mean()
 
-    total = shape_loss + 0.1 * type_loss + 0.01 * overflow
-    return total, shape_loss, type_loss, overflow
+    # Background loss: penalise any alpha outside the target's alive region
+    target_alpha_mask = (tgt[:, 3:4] > 0.1).float()
+    bg_loss = (output[:, 3:4] * (1.0 - target_alpha_mask)).mean()
+
+    total = shape_loss + 0.1 * type_loss + 0.01 * overflow + 2.0 * bg_loss
+    return total, shape_loss, type_loss, overflow, bg_loss
 
 
 def _per_sample_loss(states: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -141,7 +145,7 @@ def train(
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     rng       = np.random.default_rng()
 
-    header = f"{'Step':>6}  {'Loss':>9}  {'Shape':>9}  {'Type':>7}  {'OFlow':>7}  {'Elapsed':>7}  ETA"
+    header = f"{'Step':>6}  {'Loss':>9}  {'Shape':>9}  {'Type':>7}  {'OFlow':>7}  {'BgLoss':>7}  {'Elapsed':>7}  ETA"
     print(header)
     print("-" * len(header))
 
@@ -167,7 +171,7 @@ def train(
             x = model(x, fire_rate=CELL_FIRE_RATE)
 
         # --- Loss ---------------------------------------------------------------
-        total, shape_l, type_l, overflow_l = _compute_loss(x, target)
+        total, shape_l, type_l, overflow_l, bg_l = _compute_loss(x, target)
 
         # --- Backward + gradient normalization ----------------------------------
         optimizer.zero_grad()
@@ -191,6 +195,7 @@ def train(
                 f"{step:>6,}  {loss_val:>9.5f}  "
                 f"{shape_l.item():>9.5f}  {type_l.item():>7.5f}  "
                 f"{overflow_l.item():>7.4f}  "
+                f"{bg_l.item():>7.5f}  "
                 f"{elapsed:>6.0f}s  {eta:.0f}s"
             )
 

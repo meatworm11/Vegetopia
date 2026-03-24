@@ -37,11 +37,11 @@ ENV_CHANNELS_PHASE1 = {
 # Training hyperparameters
 # ---------------------------------------------------------------------------
 CELL_FIRE_RATE     = 0.5        # stochastic update probability per cell per step
-TRAIN_STEPS_RANGE  = (64, 96)   # random unroll length per training iteration
+TRAIN_STEPS_RANGE  = (80, 128)  # random unroll length per training iteration
 POOL_SIZE          = 1024
 BATCH_SIZE         = 8
-LEARNING_RATE      = 2e-3
-N_TRAINING_STEPS   = 5000
+LEARNING_RATE      = 1e-3
+N_TRAINING_STEPS   = 10000
 
 # ---------------------------------------------------------------------------
 # Seed positions  (row, col) — index 0 is the bottom cell (future root zone)
