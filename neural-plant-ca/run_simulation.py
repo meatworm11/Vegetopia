@@ -1,5 +1,5 @@
 """
-run_simulation.py — Multi-species NCA viewer.
+run_simulation.py — Multi-species NCA viewer with environment and nutrient diffusion.
 
 Entry points
 ------------
@@ -13,11 +13,13 @@ Entry points
 
 Controls
 --------
-    Left-click   place a new seed at cursor
+    Left-click   place a new seed at cursor (snapped to soil surface)
     Right-click  kill cells in a 3×3 area at cursor
     Space        pause / unpause
     S            step one frame while paused
     R            reset all simulations
+    D            toggle nutrient debug overlay
+    E            toggle energy system (nutrients_enabled)
     +  /  =      speed up  (more NCA steps per frame)
     -            slow down (fewer NCA steps per frame)
     Q / Escape   quit
@@ -28,10 +30,19 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
 import pygame
 import torch
 
-from config import GRID_H, GRID_W, N_CHANNELS
+from config import (
+    SIM_GRID_H, SIM_GRID_W, CELL_RENDER_SIZE, N_CHANNELS,
+    NUTRIENTS_ENABLED,
+)
+from environment import (
+    create_environment, soil_surface_row,
+    EnvironmentState, regenerate_sources, diffuse_nutrients,
+    plant_absorb_nutrients, plant_dissipate_energy, plant_death_check,
+)
 from model import NCA
 from viewer import SpeciesViewer
 
@@ -40,14 +51,14 @@ from viewer import SpeciesViewer
 # Constants
 # ---------------------------------------------------------------------------
 
-CELL_SIZE        = 8          # pixels per NCA cell
-FPS_TARGET       = 30
-BG_COLOUR        = (20, 20, 20)
-LABEL_COLOUR     = (200, 200, 200)
-PANEL_PADDING    = 12         # px between panels
-LABEL_HEIGHT     = 22         # px reserved below each panel for the species name
-MIN_STEPS_FRAME  = 1
-MAX_STEPS_FRAME  = 16
+FPS_TARGET            = 30
+BG_COLOUR             = (20, 20, 20)
+LABEL_COLOUR          = (200, 200, 200)
+PANEL_PADDING         = 12
+LABEL_HEIGHT          = 22
+MIN_STEPS_FRAME       = 1
+MAX_STEPS_FRAME       = 16
+DIFFUSION_SUBSTEPS    = 4     # nutrient diffusion steps per sim tick
 
 
 # ---------------------------------------------------------------------------
@@ -57,15 +68,13 @@ MAX_STEPS_FRAME  = 16
 def _load_model(name: str, device: torch.device) -> NCA:
     """
     Load a trained NCA from species/{name}.pt.
-
-    Raises FileNotFoundError with a helpful message if the file is missing.
     """
     path = Path('species') / f'{name}.pt'
     if not path.exists():
         raise FileNotFoundError(
             f"Model file not found: {path}\n"
             f"Train it first with:\n"
-            f"  python train_species.py --name {name} --preset {name} --steps 5000"
+            f"  python train_species.py --name {name} --preset {name} --steps 10000"
         )
 
     ckpt = torch.load(path, map_location=device, weights_only=True)
@@ -87,20 +96,13 @@ def _load_model(name: str, device: torch.device) -> NCA:
 # Layout helpers
 # ---------------------------------------------------------------------------
 
-def _layout(n_species: int, cell_size: int) -> tuple[int, int, list[int]]:
-    """
-    Return (window_width, window_height, list_of_panel_x_offsets).
-
-    Panels are laid out in a single row.
-    """
-    panel_w = GRID_W * cell_size
-    panel_h = GRID_H * cell_size + LABEL_HEIGHT
-
-    total_w = n_species * panel_w + (n_species + 1) * PANEL_PADDING
+def _layout(cell_size: int) -> tuple[int, int]:
+    """Return (window_width, window_height) for a single shared panel."""
+    panel_w = SIM_GRID_W * cell_size
+    panel_h = SIM_GRID_H * cell_size + LABEL_HEIGHT
+    total_w = panel_w + 2 * PANEL_PADDING
     total_h = panel_h + 2 * PANEL_PADDING
-
-    xs = [PANEL_PADDING + i * (panel_w + PANEL_PADDING) for i in range(n_species)]
-    return total_w, total_h, xs
+    return total_w, total_h
 
 
 # ---------------------------------------------------------------------------
@@ -109,10 +111,8 @@ def _layout(n_species: int, cell_size: int) -> tuple[int, int, list[int]]:
 
 def run_viewer(species_names: list[str]) -> None:
     """
-    Open a pygame window and display one NCA per species side-by-side.
-
-    Args:
-        species_names : list of trained species names (must have species/{name}.pt)
+    Open a pygame window and display NCA species on a shared environment
+    with nutrient diffusion running each frame.
     """
     if not species_names:
         print("run_viewer: no species specified.")
@@ -127,6 +127,7 @@ def run_viewer(species_names: list[str]) -> None:
         device = torch.device('cpu')
 
     print(f"Device : {device}")
+    print(f"Grid   : {SIM_GRID_H}×{SIM_GRID_W}  ({CELL_RENDER_SIZE}px/cell)")
     print(f"Loading {len(species_names)} species...")
 
     # Load models
@@ -134,11 +135,25 @@ def run_viewer(species_names: list[str]) -> None:
     for name in species_names:
         models[name] = _load_model(name, device)
 
+    # Create shared environment with nutrient state
+    env_grid = create_environment(SIM_GRID_H, SIM_GRID_W, rng=np.random.default_rng(42))
+    soil_row = soil_surface_row(env_grid)
+    env_state = EnvironmentState(env_grid, device=device)
+    print(f"Soil surface at row {soil_row}")
+
+    # Let nutrients reach steady-state before first frame
+    # (~10k effective diffusion steps to fill 100+ rows of air)
+    print("Initialising nutrient gradients...")
+    for _ in range(2000):
+        regenerate_sources(env_state)
+        diffuse_nutrients(env_state, n_steps=5)
+    print("  done.")
+
     # pygame setup
     pygame.init()
     pygame.display.set_caption('Vegetopia — Neural Plant CA')
 
-    win_w, win_h, panel_xs = _layout(len(species_names), CELL_SIZE)
+    win_w, win_h = _layout(CELL_RENDER_SIZE)
     screen = pygame.display.set_mode((win_w, win_h))
     clock  = pygame.time.Clock()
 
@@ -147,27 +162,31 @@ def run_viewer(species_names: list[str]) -> None:
     except Exception:
         font = pygame.font.Font(None, 16)
 
-    # Create viewers
+    # Create viewers — all share the same environment state
     viewers: list[SpeciesViewer] = [
         SpeciesViewer(
             name=name,
             model=models[name],
+            env_state=env_state,
+            soil_row=soil_row,
             device=device,
-            cell_size=CELL_SIZE,
-            bg=BG_COLOUR,
+            cell_size=CELL_RENDER_SIZE,
         )
         for name in species_names
     ]
 
-    steps_per_frame = 1
-    paused          = False
-    running         = True
+    panel_x         = PANEL_PADDING
+    panel_top       = PANEL_PADDING
+    steps_per_frame    = 1
+    paused             = False
+    show_nutrients     = False
+    nutrients_enabled  = NUTRIENTS_ENABLED
+    running            = True
 
     def _hit_viewer(mx: int, my: int):
-        """Return (viewer, local_px, local_py) for the panel under the cursor, or None."""
-        panel_top = PANEL_PADDING
-        for v, px in zip(viewers, panel_xs):
-            lx = mx - px
+        """Return (viewer, local_px, local_py) if cursor is inside the panel."""
+        for v in viewers:
+            lx = mx - panel_x
             ly = my - panel_top
             if 0 <= lx < v.pixel_w and 0 <= ly < v.pixel_h:
                 return v, lx, ly
@@ -187,12 +206,29 @@ def run_viewer(species_names: list[str]) -> None:
                     paused = not paused
 
                 elif ev.key == pygame.K_s and paused:
+                    # Single step: advance NCA + nutrients + energy
+                    regenerate_sources(env_state)
+                    diffuse_nutrients(env_state, n_steps=DIFFUSION_SUBSTEPS)
+                    if nutrients_enabled:
+                        for v in viewers:
+                            plant_absorb_nutrients(v._state, env_state)
+                            plant_dissipate_energy(v._state)
                     for v in viewers:
-                        v.step(1)
+                        v.step(1, nutrients_enabled=nutrients_enabled)
+                    if nutrients_enabled:
+                        for v in viewers:
+                            plant_death_check(v._state)
 
                 elif ev.key == pygame.K_r:
                     for v in viewers:
                         v.reset()
+
+                elif ev.key == pygame.K_d:
+                    show_nutrients = not show_nutrients
+
+                elif ev.key == pygame.K_e:
+                    nutrients_enabled = not nutrients_enabled
+                    print(f"Energy system: {'ON' if nutrients_enabled else 'OFF'}")
 
                 elif ev.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     steps_per_frame = min(steps_per_frame * 2, MAX_STEPS_FRAME)
@@ -205,35 +241,58 @@ def run_viewer(species_names: list[str]) -> None:
                 if hit is not None:
                     v, lx, ly = hit
                     row, col = v.pixel_to_grid(lx, ly)
-                    if ev.button == 1:      # left-click → place seed
+                    if ev.button == 1:
                         v.place_seed(row, col)
-                    elif ev.button == 3:    # right-click → kill 3×3
+                    elif ev.button == 3:
                         v.kill_area(row, col, radius=1)
 
         # --- Simulate ---------------------------------------------------------
         if not paused:
+            # Nutrient diffusion (runs every frame regardless of NCA)
+            regenerate_sources(env_state)
+            diffuse_nutrients(env_state, n_steps=DIFFUSION_SUBSTEPS)
+
+            # Plant absorbs nutrients before NCA step
+            if nutrients_enabled:
+                for v in viewers:
+                    plant_absorb_nutrients(v._state, env_state)
+                    plant_dissipate_energy(v._state)
+
+            # NCA step(s)
             for v in viewers:
-                v.step(steps_per_frame)
+                v.step(steps_per_frame, nutrients_enabled=nutrients_enabled)
+
+            # Death check after NCA step
+            if nutrients_enabled:
+                for v in viewers:
+                    plant_death_check(v._state)
 
         # --- Draw -------------------------------------------------------------
         screen.fill(BG_COLOUR)
 
-        panel_top = PANEL_PADDING
-        for v, px in zip(viewers, panel_xs):
-            v.draw(screen, px, panel_top)
+        for v in viewers:
+            v.draw(screen, panel_x, panel_top, show_nutrients=show_nutrients)
 
-            # Species label below the panel
-            label = font.render(
-                f'{v.name}  (step {v.step_count:,})', True, LABEL_COLOUR
+        # Species labels + plant stats
+        label_y = panel_top + SIM_GRID_H * CELL_RENDER_SIZE + 4
+        stat_parts = []
+        for v in viewers:
+            s = v.plant_stats()
+            stat_parts.append(
+                f'{v.name}:{v.step_count:,}  '
+                f'alive={s["alive"]}  '
+                f'earth={s["avg_earth"]:.2f}  air={s["avg_air"]:.2f}'
             )
-            label_y = panel_top + GRID_H * CELL_SIZE + 4
-            screen.blit(label, (px, label_y))
+        label = font.render('  |  '.join(stat_parts), True, LABEL_COLOUR)
+        screen.blit(label, (PANEL_PADDING, label_y))
 
         # Status bar
-        pause_str = 'PAUSED' if paused else 'running'
+        pause_str  = 'PAUSED' if paused else 'running'
+        nutr_str   = ' [overlay ON]' if show_nutrients else ''
+        energy_str = ' [ENERGY ON]' if nutrients_enabled else ' [energy OFF]'
         spd_label = font.render(
-            f'{pause_str}  speed: {steps_per_frame}×  [+/-]  |  '
-            f'Space=pause  S=step  R=reset  LMB=seed  RMB=kill  Q=quit',
+            f'{pause_str}  speed: {steps_per_frame}×{energy_str}{nutr_str}  |  '
+            f'Space=pause  S=step  R=reset  D=overlay  E=energy  Q=quit',
             True, (120, 120, 120),
         )
         screen.blit(spd_label, (PANEL_PADDING, 4))

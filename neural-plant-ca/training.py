@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from config import (
     BATCH_SIZE, CELL_FIRE_RATE, LEARNING_RATE,
     N_CHANNELS, POOL_SIZE, TRAIN_STEPS_RANGE, DEVICE,
-    CH_CELL_TYPE,
+    CH_CELL_TYPE, ROOT_LOSS_MASK,
 )
 from model import NCA, make_seed
 
@@ -44,7 +44,16 @@ def _compute_loss(
 
     alive_mask = (output[:, 3:4] > 0.1).float()
 
-    shape_loss = F.mse_loss(output[:, :4], tgt[:, :4].expand_as(output[:, :4]))
+    # Optional: exclude root cells (target cell_type ≈ 0.25) from shape loss
+    # so roots learn to grow toward nutrients rather than matching a fixed pattern.
+    if ROOT_LOSS_MASK:
+        tgt_ctype = tgt[:, CH_CELL_TYPE:CH_CELL_TYPE + 1]
+        root_mask = ((tgt_ctype - 0.25).abs() < 0.15).float()   # 1 where root
+        shape_weight = 1.0 - root_mask                           # 0 at root cells
+        shape_diff = (output[:, :4] - tgt[:, :4].expand_as(output[:, :4])) ** 2
+        shape_loss = (shape_diff * shape_weight).mean()
+    else:
+        shape_loss = F.mse_loss(output[:, :4], tgt[:, :4].expand_as(output[:, :4]))
 
     type_loss = F.mse_loss(
         output[:, CH_CELL_TYPE:CH_CELL_TYPE + 1] * alive_mask,

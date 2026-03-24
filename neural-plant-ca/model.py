@@ -125,16 +125,19 @@ class NCA(nn.Module):
         fire_rate: float = CELL_FIRE_RATE,
         step_size: float = 1.0,
         species_id_map: torch.Tensor | None = None,
+        nutrients_enabled: bool = False,
     ) -> torch.Tensor:
         """
         One NCA step.
 
         Args:
-            x              : state tensor (batch, N_CHANNELS, H, W)
-            fire_rate      : probability each cell updates this step
-            step_size      : scales the state delta (1.0 during training)
-            species_id_map : (batch, 1, H, W) protected species-ID values.
-                             If provided, CH_SPECIES_ID is restored after the step.
+            x                : state tensor (batch, N_CHANNELS, H, W)
+            fire_rate        : probability each cell updates this step
+            step_size        : scales the state delta (1.0 during training)
+            species_id_map   : (batch, 1, H, W) protected species-ID values.
+            nutrients_enabled: if False (default/training), earth & air are
+                               clamped to 1.0.  If True, they pass through
+                               so the external energy system can manage them.
 
         Returns:
             Updated state tensor, same shape as x.
@@ -181,11 +184,20 @@ class NCA(nn.Module):
             else new_x[:, CH_SPECIES_ID:CH_SPECIES_ID + 1]
         )
 
+        if nutrients_enabled:
+            # Energy system active: let earth/air pass through (clamped to [0,1])
+            earth_ch = new_x[:, 4:5].clamp(0.0, 1.0)
+            air_ch   = new_x[:, 5:6].clamp(0.0, 1.0)
+        else:
+            # Phase-1 / training: unlimited nutrients
+            earth_ch = torch.ones_like(new_x[:, 4:5])
+            air_ch   = torch.ones_like(new_x[:, 5:6])
+
         return torch.cat([
             new_x[:, 0:3].clamp(0.0, 1.0),           # RGB
             new_x[:, 3:4].clamp(0.0, 1.0),           # alpha
-            torch.ones_like(new_x[:, 4:5]),           # earth = 1.0
-            torch.ones_like(new_x[:, 5:6]),           # air   = 1.0
+            earth_ch,                                 # earth nutrients
+            air_ch,                                   # air nutrients
             new_x[:, 6:10],                           # water, integrity, age, cell_type
             sp_id,                                    # species_id (env-managed)
             new_x[:, 11:],                            # reserved + hidden

@@ -1,10 +1,26 @@
 import torch
 
 # ---------------------------------------------------------------------------
-# Grid
+# Grid — training dimensions (used by model, target, training loop)
 # ---------------------------------------------------------------------------
 GRID_H = 64
 GRID_W = 64
+
+# ---------------------------------------------------------------------------
+# Grid — simulation / viewer dimensions (larger landscape for display)
+# ---------------------------------------------------------------------------
+SIM_GRID_H      = 128
+SIM_GRID_W      = 256
+CELL_RENDER_SIZE = 4    # pixels per cell on screen → window is 1024×512
+
+# ---------------------------------------------------------------------------
+# Environment cell types (background grid, NOT plant cell_type channel 9)
+# ---------------------------------------------------------------------------
+ENV_EMPTY = 0    # void / air above ground
+ENV_SOIL  = 1    # basic soil
+ENV_ROCK  = 2    # immovable, future nutrient/integrity source
+ENV_SUN   = 3    # top row, future air nutrient source
+ENV_WATER = 4    # reserved for future
 
 # ---------------------------------------------------------------------------
 # State vector — 32 channels per cell
@@ -42,6 +58,15 @@ POOL_SIZE          = 1024
 BATCH_SIZE         = 8
 LEARNING_RATE      = 1e-3
 N_TRAINING_STEPS   = 10000
+
+# ---------------------------------------------------------------------------
+# Energy system (plant nutrient absorption / dissipation / death)
+# ---------------------------------------------------------------------------
+ABSORPTION_RATE    = 0.05     # nutrients absorbed per step by root/leaf cells
+DISSIPATION_RATE   = 0.002    # nutrients lost per step per alive cell (maintenance)
+DEATH_THRESHOLD    = 0.01     # cell dies if BOTH earth AND air drop below this
+NUTRIENTS_ENABLED  = False    # False = phase-1 (channels 4-5 clamped to 1.0)
+ROOT_LOSS_MASK     = True     # exclude root cells from shape loss during training
 
 # ---------------------------------------------------------------------------
 # Seed positions  (row, col) — index 0 is the bottom cell (future root zone)
