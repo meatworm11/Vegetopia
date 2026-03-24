@@ -163,11 +163,6 @@ class NCA(nn.Module):
         ).float()
         new_x = new_x * alive_mask
 
-        # 5b. Hard alpha clamping — zero ALL channels for cells with alpha < 0.1.
-        #     This kills ghost cells more aggressively than the neighbourhood alive mask alone.
-        hard_alive = (new_x[:, CH_ALPHA:CH_ALPHA + 1] > 0.1).float()
-        new_x = new_x * hard_alive
-
         # 6. Reconstruct output via torch.cat — avoids all in-place ops on new_x,
         #    which would corrupt the autograd graph when backpropping through unrolled steps.
         #
