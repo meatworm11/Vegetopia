@@ -51,13 +51,13 @@ Use `python -u` when piping output (e.g. to `tee`), otherwise Python buffers std
 - `6-11`: water, integrity, age, cell_type, species_id, reserved
 - `12-31`: learned hidden state
 
-**NCA forward pass** (`model.py`): fixed Sobel perception (32→96 channels) → two 1×1 convs (96→128→32) → stochastic fire mask → living cell mask → hard alpha clamp (all channels zeroed where alpha < 0.1) → env channel restoration. The final conv layer is zero-initialized so training starts from a no-op.
+**NCA forward pass** (`model.py`): fixed Sobel perception (32→96 channels) → two 1×1 convs (96→128→32) → stochastic fire mask → living cell mask → env channel restoration. The final conv layer is zero-initialized so training starts from a no-op.
 
 **Training loop** (`training.py`): pool-based strategy (pool of 1024 states). Each step: sample a batch of 8, replace the worst sample with a fresh seed, unroll the NCA for 80–128 random steps, backprop with per-parameter gradient normalization (prevents exploding gradients through long unrolls). Loss = MSE on RGBA + 0.1×cell-type MSE + 0.01×hidden overflow + 2.0×background loss (penalises alpha outside target mask).
 
 **Targets** (`target.py`): procedurally generated per-preset trees with small random perturbations each run (`perturb_height`, `perturb_radius`). Presets: `oak`, `pine`, `fern`, `bush`.
 
-**Viewer** (`viewer.py`, `run_simulation.py`): `SpeciesViewer` wraps one model + grid state; `run_simulation.run_viewer(names)` lays out panels side-by-side in pygame. Viewer controls: R/Space = reset, +/- = speed (1×–16× steps/frame), Q/Esc = quit.
+**Viewer** (`viewer.py`, `run_simulation.py`): `SpeciesViewer` wraps one model + grid state; `run_simulation.run_viewer(names)` lays out panels side-by-side in pygame. Controls are handled centrally in `run_simulation.py`; `SpeciesViewer` exposes `place_seed(row, col)`, `kill_area(row, col)`, and `pixel_to_grid(px, py)`. Viewer controls: Space = pause/unpause, S = step (while paused), R = reset, LMB = place seed, RMB = kill 3×3, +/- = speed (1×–16×), Q/Esc = quit.
 
 ## Outputs
 

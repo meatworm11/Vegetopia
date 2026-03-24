@@ -13,10 +13,14 @@ Entry points
 
 Controls
 --------
-    R / SPACE   reset all simulations
-    Q / Escape  quit
-    +  /  =     speed up  (more NCA steps per frame)
-    -           slow down (fewer NCA steps per frame)
+    Left-click   place a new seed at cursor
+    Right-click  kill cells in a 3×3 area at cursor
+    Space        pause / unpause
+    S            step one frame while paused
+    R            reset all simulations
+    +  /  =      speed up  (more NCA steps per frame)
+    -            slow down (fewer NCA steps per frame)
+    Q / Escape   quit
 """
 
 from __future__ import annotations
@@ -156,7 +160,18 @@ def run_viewer(species_names: list[str]) -> None:
     ]
 
     steps_per_frame = 1
+    paused          = False
     running         = True
+
+    def _hit_viewer(mx: int, my: int):
+        """Return (viewer, local_px, local_py) for the panel under the cursor, or None."""
+        panel_top = PANEL_PADDING
+        for v, px in zip(viewers, panel_xs):
+            lx = mx - px
+            ly = my - panel_top
+            if 0 <= lx < v.pixel_w and 0 <= ly < v.pixel_h:
+                return v, lx, ly
+        return None
 
     while running:
         # --- Events -----------------------------------------------------------
@@ -168,7 +183,14 @@ def run_viewer(species_names: list[str]) -> None:
                 if ev.key in (pygame.K_q, pygame.K_ESCAPE):
                     running = False
 
-                elif ev.key in (pygame.K_r, pygame.K_SPACE):
+                elif ev.key == pygame.K_SPACE:
+                    paused = not paused
+
+                elif ev.key == pygame.K_s and paused:
+                    for v in viewers:
+                        v.step(1)
+
+                elif ev.key == pygame.K_r:
                     for v in viewers:
                         v.reset()
 
@@ -178,13 +200,20 @@ def run_viewer(species_names: list[str]) -> None:
                 elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                     steps_per_frame = max(steps_per_frame // 2, MIN_STEPS_FRAME)
 
-            else:
-                for v in viewers:
-                    v.handle_event(ev)
+            elif ev.type == pygame.MOUSEBUTTONDOWN:
+                hit = _hit_viewer(*ev.pos)
+                if hit is not None:
+                    v, lx, ly = hit
+                    row, col = v.pixel_to_grid(lx, ly)
+                    if ev.button == 1:      # left-click → place seed
+                        v.place_seed(row, col)
+                    elif ev.button == 3:    # right-click → kill 3×3
+                        v.kill_area(row, col, radius=1)
 
         # --- Simulate ---------------------------------------------------------
-        for v in viewers:
-            v.step(steps_per_frame)
+        if not paused:
+            for v in viewers:
+                v.step(steps_per_frame)
 
         # --- Draw -------------------------------------------------------------
         screen.fill(BG_COLOUR)
@@ -200,9 +229,11 @@ def run_viewer(species_names: list[str]) -> None:
             label_y = panel_top + GRID_H * CELL_SIZE + 4
             screen.blit(label, (px, label_y))
 
-        # Speed indicator in top-left corner
+        # Status bar
+        pause_str = 'PAUSED' if paused else 'running'
         spd_label = font.render(
-            f'speed: {steps_per_frame}×  [+/-]  |  R=reset  Q=quit',
+            f'{pause_str}  speed: {steps_per_frame}×  [+/-]  |  '
+            f'Space=pause  S=step  R=reset  LMB=seed  RMB=kill  Q=quit',
             True, (120, 120, 120),
         )
         screen.blit(spd_label, (PANEL_PADDING, 4))

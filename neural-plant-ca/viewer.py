@@ -19,7 +19,11 @@ import numpy as np
 import pygame
 import torch
 
-from config import GRID_H, GRID_W, N_CHANNELS, CH_RGB, CH_ALPHA, CELL_FIRE_RATE
+from config import (
+    GRID_H, GRID_W, N_CHANNELS,
+    CH_RGB, CH_ALPHA, CH_HIDDEN, CH_SPECIES_ID, CH_EARTH, CH_AIR,
+    CELL_FIRE_RATE,
+)
 from model import NCA, make_seed
 
 
@@ -119,6 +123,33 @@ class SpeciesViewer:
         self._step_count += n
         self._dirty = True
 
+    def place_seed(self, row: int, col: int) -> None:
+        """Place a new seed at (row, col) on the grid."""
+        if not (0 <= row < GRID_H and 0 <= col < GRID_W):
+            return
+        with torch.no_grad():
+            self._state[0, CH_ALPHA, row, col]    = 1.0
+            self._state[0, CH_HIDDEN, row, col]   = 1.0
+            self._state[0, CH_EARTH, row, col]    = 1.0
+            self._state[0, CH_AIR, row, col]      = 1.0
+        self._dirty = True
+
+    def kill_area(self, row: int, col: int, radius: int = 1) -> None:
+        """Zero all channels in a (2*radius+1) square centred on (row, col)."""
+        r0 = max(0, row - radius)
+        r1 = min(GRID_H, row + radius + 1)
+        c0 = max(0, col - radius)
+        c1 = min(GRID_W, col + radius + 1)
+        with torch.no_grad():
+            self._state[0, :, r0:r1, c0:c1] = 0.0
+        self._dirty = True
+
+    def pixel_to_grid(self, px: int, py: int) -> tuple[int, int]:
+        """Convert pixel offset (relative to panel top-left) to grid (row, col)."""
+        col = px // self.cell_size
+        row = py // self.cell_size
+        return row, col
+
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
@@ -139,21 +170,6 @@ class SpeciesViewer:
             self._rebuild_surface()
         if self._surface is not None:
             target.blit(self._surface, (x, y))
-
-    # ------------------------------------------------------------------
-    # Input
-    # ------------------------------------------------------------------
-
-    def handle_event(self, ev: pygame.event.Event) -> bool:
-        """
-        Handle a pygame event.  Returns True if consumed.
-
-        R / SPACE  →  reset simulation
-        """
-        if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_r, pygame.K_SPACE):
-            self.reset()
-            return True
-        return False
 
     # ------------------------------------------------------------------
     # Properties
