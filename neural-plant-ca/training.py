@@ -38,37 +38,11 @@ from config import (
     GRID_H, GRID_W,
     CH_ALPHA, CH_EARTH, CH_AIR, CH_CELL_TYPE, ROOT_LOSS_MASK,
     NUTRIENT_TRANSPORT_STEPS,
-    ABSORPTION_RATE, DISSIPATION_RATE,
 )
 from model import NCA, make_seed
 
 # Training batch size — smaller than simulation for speed
 TRAIN_BATCH_SIZE = 4
-
-
-# ---------------------------------------------------------------------------
-# Curriculum phases
-# ---------------------------------------------------------------------------
-
-DEFAULT_PHASE_A_END = 1000   # clamped nutrients, new loss terms
-DEFAULT_PHASE_B_END = 3000   # gentle energy rates
-
-# Phase B rates: 10x less dissipation, 2x more absorption
-GENTLE_DISSIPATION = 0.0002
-GENTLE_ABSORPTION  = 0.10
-
-
-def _curriculum_phase(step: int, curriculum: bool,
-                      phase_a_end: int = DEFAULT_PHASE_A_END,
-                      phase_b_end: int = DEFAULT_PHASE_B_END) -> str:
-    """Return 'A', 'B', or 'C' based on step and curriculum flag."""
-    if not curriculum:
-        return 'C'   # full energy when not using curriculum
-    if step <= phase_a_end:
-        return 'A'
-    if step <= phase_b_end:
-        return 'B'
-    return 'C'
 
 
 # ---------------------------------------------------------------------------
@@ -130,15 +104,15 @@ def _compute_loss(
     total = shape_loss + 0.1 * type_loss + 0.01 * overflow + 2.0 * bg_loss + 0.1 * stem_loss
 
     # --- Energy health loss ---
-    # Penalize alive cells with nutrients below 0.5.
+    # Penalize alive cells with nutrients below 0.85.
     # Forces the model to grow roots (earth supply) and leaves (air supply).
     energy_loss = torch.tensor(0.0, device=output.device)
     if energy_health:
         earth = output[:, CH_EARTH:CH_EARTH + 1]   # (B, 1, H, W)
         air   = output[:, CH_AIR:CH_AIR + 1]       # (B, 1, H, W)
         n_alive = alive_mask.sum().clamp(min=1)
-        earth_deficit = (0.5 - earth).clamp(min=0) * alive_mask
-        air_deficit   = (0.5 - air).clamp(min=0) * alive_mask
+        earth_deficit = (0.85 - earth).clamp(min=0) * alive_mask
+        air_deficit   = (0.85 - air).clamp(min=0) * alive_mask
         energy_loss = (earth_deficit.sum() + air_deficit.sum()) / n_alive
         total = total + 0.5 * energy_loss
 
@@ -202,9 +176,6 @@ def train(
     snapshot_every: int = 500,
     checkpoint_every: int = 1000,
     energy: bool = False,
-    curriculum: bool = False,
-    phase_a_end: int = DEFAULT_PHASE_A_END,
-    phase_b_end: int = DEFAULT_PHASE_B_END,
     lr: float = LEARNING_RATE,
 ) -> NCA:
     """
@@ -219,12 +190,7 @@ def train(
         snapshot_every   : save side-by-side image every N steps
         checkpoint_every : save intermediate .pt checkpoint every N steps
         energy           : if True, run environment physics during unroll
-        curriculum       : if True (requires energy), use staged training:
-                           A (1-phase_a_end): clamped nutrients + new losses
-                           B (phase_a_end+1 - phase_b_end): gentle energy rates
-                           C (phase_b_end+1+): full energy rates
-        phase_a_end      : last step of curriculum phase A
-        phase_b_end      : last step of curriculum phase B
+                           with finite nutrient pool (no regeneration)
         lr               : learning rate (default LEARNING_RATE; 5e-4 for fine-tuning)
 
     Returns:
@@ -244,23 +210,15 @@ def train(
         )
         env_grid = create_environment(GRID_H, GRID_W, rng=np.random.default_rng(42))
         env_state = EnvironmentState(env_grid, device=device)
-        # Warmup nutrient gradients
+        # Prepare a fully-charged snapshot of the nutrient grid.
+        # Each rollout resets to this snapshot — no regeneration during unroll,
+        # so the plant faces a finite nutrient pool.
         print("Warming up training environment nutrients...")
         for _ in range(500):
             regenerate_sources(env_state)
             diffuse_nutrients(env_state, n_steps=5)
+        env_nutrient_snapshot = env_state.nutrient_grid.clone()
         print("  done.")
-
-    if curriculum and not energy:
-        print("WARNING: --curriculum requires --energy. Ignoring --curriculum.")
-        curriculum = False
-
-    if curriculum:
-        print(f"Curriculum: A (1-{phase_a_end}) clamped + new losses")
-        print(f"            B ({phase_a_end+1}-{phase_b_end}) "
-              f"gentle energy (dissip={GENTLE_DISSIPATION}, absorb={GENTLE_ABSORPTION})")
-        print(f"            C ({phase_b_end+1}+) full energy "
-              f"(dissip={DISSIPATION_RATE}, absorb={ABSORPTION_RATE})")
 
     # Pool lives on CPU to avoid VRAM pressure; batches are moved to device per step.
     seed_cpu = make_seed(1, device=torch.device('cpu'))            # (1, C, H, W)
@@ -270,7 +228,7 @@ def train(
     rng       = np.random.default_rng()
 
     header = (
-        f"{'Step':>6}  {'Ph':>2}  {'Loss':>9}  {'Shape':>9}  {'Type':>7}  "
+        f"{'Step':>6}  {'Loss':>9}  {'Shape':>9}  {'Type':>7}  "
         f"{'OFlow':>7}  {'BgLoss':>7}  {'Stem':>7}  {'Energy':>7}  {'Alive':>5}  {'Elapsed':>7}  ETA"
     )
     print(header)
@@ -278,28 +236,8 @@ def train(
 
     t0           = time.time()
     loss_history = []
-    prev_phase   = None
 
     for step in range(1, n_steps + 1):
-
-        phase = _curriculum_phase(step, curriculum, phase_a_end, phase_b_end)
-
-        # Log phase transitions
-        if phase != prev_phase:
-            if prev_phase is not None:
-                print(f"  >>> Phase {prev_phase} → {phase} at step {step}")
-            prev_phase = phase
-
-        # Determine whether this step uses energy physics
-        step_energy = energy and (phase != 'A')
-
-        # Determine absorption/dissipation rates for this step
-        if phase == 'B':
-            step_absorb  = GENTLE_ABSORPTION
-            step_dissip  = GENTLE_DISSIPATION
-        else:
-            step_absorb  = ABSORPTION_RATE
-            step_dissip  = DISSIPATION_RATE
 
         # --- Sample batch -------------------------------------------------------
         indices = rng.choice(POOL_SIZE, size=TRAIN_BATCH_SIZE, replace=False)
@@ -311,27 +249,30 @@ def train(
         worst        = int(per_sample.argmax().item())
         batch[worst] = make_seed(1, device=device).squeeze(0)
 
+        # --- Reset environment nutrients to full for this rollout ---------------
+        if energy:
+            env_state.nutrient_grid.copy_(env_nutrient_snapshot)
+
         # --- Unroll NCA ---------------------------------------------------------
         n_nca = int(rng.integers(TRAIN_STEPS_RANGE[0], TRAIN_STEPS_RANGE[1] + 1))
         x     = batch
         for _ in range(n_nca):
-            x = model(x, fire_rate=CELL_FIRE_RATE, nutrients_enabled=step_energy)
+            x = model(x, fire_rate=CELL_FIRE_RATE, nutrients_enabled=energy)
 
-            # Energy-aware: run environment physics after each NCA step
-            if step_energy:
+            # Energy-aware: run environment physics after each NCA step.
+            # No regeneration — finite nutrient pool forces efficient growth.
+            if energy:
                 with torch.no_grad():
-                    regenerate_sources(env_state)
                     diffuse_nutrients(env_state, n_steps=1)
                     for b in range(x.shape[0]):
                         sample = x[b:b+1]  # (1, C, H, W)
-                        plant_absorb_nutrients(sample, env_state,
-                                               rate=step_absorb)
+                        plant_absorb_nutrients(sample, env_state)
                         transport_nutrients(sample, n_steps=NUTRIENT_TRANSPORT_STEPS)
-                        plant_dissipate_energy(sample, rate=step_dissip)
+                        plant_dissipate_energy(sample)
                         plant_death_check(sample)
 
         # --- Debug: nutrient levels after unroll -----------------------------------
-        if step_energy and step % 100 == 0:
+        if energy and step % 100 == 0:
             with torch.no_grad():
                 s = x[0]  # first batch item: (C, H, W)
                 alive = s[CH_ALPHA] > 0.1
@@ -370,7 +311,7 @@ def train(
             eta     = elapsed / step * (n_steps - step)
             n_alive = int((x[:, CH_ALPHA] > 0.1).float().sum().item())
             print(
-                f"{step:>6,}   {phase}  {loss_val:>9.5f}  "
+                f"{step:>6,}  {loss_val:>9.5f}  "
                 f"{shape_l.item():>9.5f}  {type_l.item():>7.5f}  "
                 f"{overflow_l.item():>7.4f}  "
                 f"{bg_l.item():>7.5f}  "
@@ -395,7 +336,6 @@ def train(
                 'name':             name,
                 'loss':             loss_val,
                 'energy':           energy,
-                'curriculum_phase': phase,
             }, ckpt)
             print(f"         [checkpoint] {ckpt}")
 

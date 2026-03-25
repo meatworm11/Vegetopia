@@ -19,9 +19,9 @@ cd neural-plant-ca
 python -u train_species.py --name oak --preset oak --steps 10000
 python -u train_species.py --name pine --preset pine --steps 10000 --seed 7
 
-# Energy-aware curriculum training (phase 2)
-python -u train_species.py --name oak_v2 --preset oak --steps 10000 --energy --curriculum
-python -u train_species.py --name oak_v2 --preset oak --steps 10000 --energy --curriculum --init-from species/oak.pt
+# Energy-aware training (phase 2) — finite nutrient pool, no curriculum
+python -u train_species.py --name oak_v2 --preset oak --steps 10000 --energy
+python -u train_species.py --name oak_v2 --preset oak --steps 10000 --energy --init-from species/oak.pt
 
 # Quick smoke test (fast, CPU, few steps)
 python -u train_species.py --name oak --steps 2000 --device cpu
@@ -88,7 +88,7 @@ neural-plant-ca/
 
 ### Training Loop
 
-`training.py`: pool-based strategy (1024 states). Each step: sample batch of 4, replace worst with fresh seed, unroll NCA for 80-128 random steps, backprop with per-parameter gradient normalization. Loss = shape MSE (root-masked) + 0.1x cell-type + 0.01x overflow + 2.0x bg + 0.1x stem-colour. Energy-aware mode (`--energy`): runs environment physics during unroll, adds 0.5x energy health loss (penalizes alive cells with nutrients below 0.5). Curriculum mode (`--curriculum`): Phase A (1-3000) clamped nutrients + new losses, Phase B (3001-6000) gentle energy rates, Phase C (6001+) full rates. Fine-tuning: `--init-from` loads pretrained weights at LR 5e-4.
+`training.py`: pool-based strategy (1024 states). Each step: sample batch of 4, replace worst with fresh seed, unroll NCA for 80-128 random steps, backprop with per-parameter gradient normalization. Loss = shape MSE (root-masked) + 0.1x cell-type + 0.01x overflow + 2.0x bg + 0.1x stem-colour. Energy-aware mode (`--energy`): runs environment physics during unroll with a finite nutrient pool (no regeneration — nutrients deplete as the plant grows), adds 0.5x energy health loss (penalizes alive cells with nutrients below 0.85). Fine-tuning: `--init-from` loads pretrained weights at LR 5e-4.
 
 ### Environment System
 
@@ -128,4 +128,4 @@ Training runs on **Google Colab** (GPU). Trained model checkpoints are saved to 
 
 - **No real root growth yet:** Current trained models produce root cell types but roots don't meaningfully grow underground. Needs energy-aware retraining so the NCA learns that roots are essential for nutrient absorption.
 - **Gravity needs retraining:** Gravity is implemented but current models weren't trained with it. Trees collapse when gravity is toggled on. After energy-aware retraining, models should learn to build structurally sound trunks.
-- **Energy health loss untested:** The energy health loss (penalizes alive cells with nutrients below 0.5, weighted 0.5) replaced the old survival bonus but hasn't been validated with a full training run yet.
+- **Energy health loss untested:** The energy health loss (penalizes alive cells with nutrients below 0.85, weighted 0.5, finite nutrient pool) replaced the old survival bonus but hasn't been validated with a full training run yet.
