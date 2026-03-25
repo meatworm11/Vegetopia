@@ -4,9 +4,15 @@ training.py — Pool-based NCA training loop.
 Strategy (Growing NCA "what persists, exists"):
   - Maintain a pool of 1024 grid states at various growth stages.
   - Each iteration: sample a batch, replace the worst sample with a fresh seed,
-    unroll the NCA for 64-96 random steps, compute loss, backprop, write back.
+    unroll the NCA for 80-128 random steps, compute loss, backprop, write back.
   - Per-parameter gradient normalization prevents exploding gradients through
     long unrolled sequences.
+
+Energy-aware mode (energy=True):
+  - Channels 4-5 are NOT clamped to 1.0 — plants must absorb nutrients
+  - Each NCA step is followed by environment physics: diffusion, absorption,
+    transport, dissipation, and death check
+  - A survival bonus rewards keeping cells alive
 """
 
 import time
@@ -22,7 +28,9 @@ import torch.nn.functional as F
 from config import (
     BATCH_SIZE, CELL_FIRE_RATE, LEARNING_RATE,
     N_CHANNELS, POOL_SIZE, TRAIN_STEPS_RANGE, DEVICE,
-    CH_CELL_TYPE, ROOT_LOSS_MASK,
+    GRID_H, GRID_W,
+    CH_ALPHA, CH_CELL_TYPE, ROOT_LOSS_MASK,
+    NUTRIENT_TRANSPORT_STEPS,
 )
 from model import NCA, make_seed
 
@@ -31,12 +39,17 @@ from model import NCA, make_seed
 # Loss
 # ---------------------------------------------------------------------------
 
+# Target stem colour for colour-consistency loss
+_STEM_BROWN = torch.tensor([0.45, 0.30, 0.15]).view(3, 1, 1)
+
+
 def _compute_loss(
     output: torch.Tensor,
     target: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    energy: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Return (total_loss, shape_loss, type_loss, overflow_loss, bg_loss).
+    Return (total_loss, shape_loss, type_loss, overflow_loss, bg_loss, stem_loss).
 
     target shape: (N_CHANNELS, H, W) — broadcast over batch automatically.
     """
@@ -44,8 +57,7 @@ def _compute_loss(
 
     alive_mask = (output[:, 3:4] > 0.1).float()
 
-    # Optional: exclude root cells (target cell_type ≈ 0.25) from shape loss
-    # so roots learn to grow toward nutrients rather than matching a fixed pattern.
+    # --- Shape loss (with root masking) ---
     if ROOT_LOSS_MASK:
         tgt_ctype = tgt[:, CH_CELL_TYPE:CH_CELL_TYPE + 1]
         root_mask = ((tgt_ctype - 0.25).abs() < 0.15).float()   # 1 where root
@@ -55,6 +67,7 @@ def _compute_loss(
     else:
         shape_loss = F.mse_loss(output[:, :4], tgt[:, :4].expand_as(output[:, :4]))
 
+    # --- Cell-type loss ---
     type_loss = F.mse_loss(
         output[:, CH_CELL_TYPE:CH_CELL_TYPE + 1] * alive_mask,
         tgt[:, CH_CELL_TYPE:CH_CELL_TYPE + 1].expand_as(
@@ -62,14 +75,31 @@ def _compute_loss(
         ) * alive_mask,
     )
 
+    # --- Hidden channel overflow ---
     overflow = (output[:, 12:].abs() - 5).clamp(min=0).mean()
 
-    # Background loss: penalise any alpha outside the target's alive region
+    # --- Background loss ---
     target_alpha_mask = (tgt[:, 3:4] > 0.1).float()
     bg_loss = (output[:, 3:4] * (1.0 - target_alpha_mask)).mean()
 
-    total = shape_loss + 0.1 * type_loss + 0.01 * overflow + 2.0 * bg_loss
-    return total, shape_loss, type_loss, overflow, bg_loss
+    # --- Stem colour consistency loss ---
+    # Push alive stem cells (type ≈ 0.5) toward brown RGB
+    out_ctype = output[:, CH_CELL_TYPE:CH_CELL_TYPE + 1]
+    is_stem = ((out_ctype - 0.5).abs() < 0.1).float() * alive_mask  # (B,1,H,W)
+    stem_target = _STEM_BROWN.to(output.device).unsqueeze(0)         # (1,3,1,1)
+    stem_diff = (output[:, :3] - stem_target) ** 2                   # (B,3,H,W)
+    stem_count = is_stem.sum().clamp(min=1)
+    stem_loss = (stem_diff * is_stem).sum() / (stem_count * 3)
+
+    total = shape_loss + 0.1 * type_loss + 0.01 * overflow + 2.0 * bg_loss + 0.1 * stem_loss
+
+    # --- Survival bonus (energy mode only) ---
+    if energy:
+        n_alive = (output[:, CH_ALPHA:CH_ALPHA + 1] > 0.1).float().sum()
+        survival_bonus = -0.001 * n_alive
+        total = total + survival_bonus
+
+    return total, shape_loss, type_loss, overflow, bg_loss, stem_loss
 
 
 def _per_sample_loss(states: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -128,6 +158,8 @@ def train(
     device: torch.device = DEVICE,
     snapshot_every: int = 500,
     checkpoint_every: int = 1000,
+    energy: bool = False,
+    lr: float = LEARNING_RATE,
 ) -> NCA:
     """
     Pool-based NCA training.
@@ -140,6 +172,8 @@ def train(
         device           : torch device
         snapshot_every   : save side-by-side image every N steps
         checkpoint_every : save intermediate .pt checkpoint every N steps
+        energy           : if True, run environment physics during unroll
+        lr               : learning rate (default LEARNING_RATE; 5e-4 for fine-tuning)
 
     Returns:
         Trained NCA model.
@@ -147,14 +181,35 @@ def train(
     species_dir   = Path('species');   species_dir.mkdir(exist_ok=True)
     snapshots_dir = Path('snapshots'); snapshots_dir.mkdir(exist_ok=True)
 
+    # --- Energy-aware training environment ---
+    env_state = None
+    if energy:
+        from environment import (
+            create_environment, EnvironmentState,
+            regenerate_sources, diffuse_nutrients,
+            plant_absorb_nutrients, transport_nutrients,
+            plant_dissipate_energy, plant_death_check,
+        )
+        env_grid = create_environment(GRID_H, GRID_W, rng=np.random.default_rng(42))
+        env_state = EnvironmentState(env_grid, device=device)
+        # Warmup nutrient gradients
+        print("Warming up training environment nutrients...")
+        for _ in range(500):
+            regenerate_sources(env_state)
+            diffuse_nutrients(env_state, n_steps=5)
+        print("  done.")
+
     # Pool lives on CPU to avoid VRAM pressure; batches are moved to device per step.
     seed_cpu = make_seed(1, device=torch.device('cpu'))            # (1, C, H, W)
     pool     = seed_cpu.expand(POOL_SIZE, -1, -1, -1).clone()     # (POOL_SIZE, C, H, W)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     rng       = np.random.default_rng()
 
-    header = f"{'Step':>6}  {'Loss':>9}  {'Shape':>9}  {'Type':>7}  {'OFlow':>7}  {'BgLoss':>7}  {'Elapsed':>7}  ETA"
+    header = (
+        f"{'Step':>6}  {'Loss':>9}  {'Shape':>9}  {'Type':>7}  "
+        f"{'OFlow':>7}  {'BgLoss':>7}  {'Stem':>7}  {'Elapsed':>7}  ETA"
+    )
     print(header)
     print("-" * len(header))
 
@@ -177,10 +232,25 @@ def train(
         n_nca = int(rng.integers(TRAIN_STEPS_RANGE[0], TRAIN_STEPS_RANGE[1] + 1))
         x     = batch
         for _ in range(n_nca):
-            x = model(x, fire_rate=CELL_FIRE_RATE)
+            x = model(x, fire_rate=CELL_FIRE_RATE, nutrients_enabled=energy)
+
+            # Energy-aware: run environment physics after each NCA step
+            if energy:
+                with torch.no_grad():
+                    regenerate_sources(env_state)
+                    diffuse_nutrients(env_state, n_steps=2)
+                    # Process each sample in the batch individually
+                    for b in range(x.shape[0]):
+                        sample = x[b:b+1]  # (1, C, H, W)
+                        plant_absorb_nutrients(sample, env_state)
+                        transport_nutrients(sample, n_steps=NUTRIENT_TRANSPORT_STEPS)
+                        plant_dissipate_energy(sample)
+                        plant_death_check(sample)
 
         # --- Loss ---------------------------------------------------------------
-        total, shape_l, type_l, overflow_l, bg_l = _compute_loss(x, target)
+        total, shape_l, type_l, overflow_l, bg_l, stem_l = _compute_loss(
+            x, target, energy=energy,
+        )
 
         # --- Backward + gradient normalization ----------------------------------
         optimizer.zero_grad()
@@ -205,6 +275,7 @@ def train(
                 f"{shape_l.item():>9.5f}  {type_l.item():>7.5f}  "
                 f"{overflow_l.item():>7.4f}  "
                 f"{bg_l.item():>7.5f}  "
+                f"{stem_l.item():>7.5f}  "
                 f"{elapsed:>6.0f}s  {eta:.0f}s"
             )
 
@@ -222,6 +293,7 @@ def train(
                 'n_channels':       N_CHANNELS,
                 'name':             name,
                 'loss':             loss_val,
+                'energy':           energy,
             }, ckpt)
             print(f"         [checkpoint] {ckpt}")
 
@@ -233,6 +305,7 @@ def train(
         'n_channels':       N_CHANNELS,
         'name':             name,
         'loss':             loss_history[-1] if loss_history else None,
+        'energy':           energy,
     }, final)
 
     elapsed = time.time() - t0

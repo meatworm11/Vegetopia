@@ -25,7 +25,7 @@ import torch
 from config import (
     SIM_GRID_H, SIM_GRID_W, CELL_RENDER_SIZE, N_CHANNELS,
     CH_RGB, CH_ALPHA, CH_HIDDEN, CH_SPECIES_ID, CH_EARTH, CH_AIR,
-    CH_CELL_TYPE, CELL_FIRE_RATE,
+    CH_CELL_TYPE, CH_INTEGRITY, CELL_FIRE_RATE, MAX_CELLS,
     ENV_EMPTY, ENV_SOIL, ENV_ROCK, ENV_SUN,
 )
 from environment import EnvironmentState, NUTRIENT_EARTH, NUTRIENT_AIR
@@ -129,14 +129,16 @@ def build_nutrient_overlay(
 def build_plant_health_overlay(
     state: torch.Tensor,
     cell_size: int,
+    show_integrity: bool = False,
 ) -> pygame.Surface:
     """
-    Build overlay colouring alive plant cells by their nutrient health.
+    Build overlay colouring alive plant cells.
 
-    - Green tint when both nutrients high
-    - Yellow when nutrients are middling
-    - Red when near death
-    - Transparent for dead / empty cells
+    When show_integrity=False (default):
+      - Green when both nutrients high, yellow middling, red near death
+
+    When show_integrity=True:
+      - Green = high integrity, red = about to fall (integrity ≤ 0)
 
     state shape: (N_CHANNELS, H, W)
     """
@@ -144,18 +146,26 @@ def build_plant_health_overlay(
     h, w = t.shape[1], t.shape[2]
 
     alpha = t[CH_ALPHA].numpy()
-    earth = t[CH_EARTH].numpy().clip(0, 1)
-    air   = t[CH_AIR].numpy().clip(0, 1)
-
     alive = alpha > 0.1
-    health = np.where(alive, np.minimum(earth, air), 0.0)   # 0..1
 
     overlay = np.zeros((h, w, 4), dtype=np.uint8)
-    # health 0 → red (255,0,0), health 0.5 → yellow (255,255,0), health 1 → green (0,255,0)
-    overlay[alive, 0] = (np.maximum(1.0 - health[alive] * 2, 0.0) * 255).astype(np.uint8)  # R
-    overlay[alive, 1] = (np.minimum(health[alive] * 2, 1.0) * 255).astype(np.uint8)        # G
-    overlay[alive, 2] = 0
-    overlay[alive, 3] = 140  # semi-transparent
+
+    if show_integrity:
+        integrity = t[CH_INTEGRITY].numpy().clip(0, 100)
+        # Normalize: 0 → red, 50 → yellow, 100 → green
+        norm = integrity / 100.0
+        overlay[alive, 0] = (np.maximum(1.0 - norm[alive] * 2, 0.0) * 255).astype(np.uint8)
+        overlay[alive, 1] = (np.minimum(norm[alive] * 2, 1.0) * 255).astype(np.uint8)
+        overlay[alive, 2] = 0
+        overlay[alive, 3] = 140
+    else:
+        earth = t[CH_EARTH].numpy().clip(0, 1)
+        air   = t[CH_AIR].numpy().clip(0, 1)
+        health = np.where(alive, np.minimum(earth, air), 0.0)
+        overlay[alive, 0] = (np.maximum(1.0 - health[alive] * 2, 0.0) * 255).astype(np.uint8)
+        overlay[alive, 1] = (np.minimum(health[alive] * 2, 1.0) * 255).astype(np.uint8)
+        overlay[alive, 2] = 0
+        overlay[alive, 3] = 140
 
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
     pygame.surfarray.pixels3d(surf)[:, :, :] = overlay[:, :, :3].transpose(1, 0, 2)
@@ -273,14 +283,24 @@ class SpeciesViewer:
         self._dirty = True
 
     def step(self, n: int = 1, nutrients_enabled: bool = False) -> None:
-        """Advance the simulation by *n* NCA steps (no grad)."""
+        """Advance the simulation by *n* NCA steps (no grad).
+
+        Growth cap: if alive cells exceed MAX_CELLS after any step,
+        revert newly spawned cells (alpha went from 0 to >0) back to zero.
+        """
         with torch.no_grad():
             for _ in range(n):
+                was_alive = self._state[0, CH_ALPHA] > 0.1
                 self._state = self.model(
                     self._state,
                     fire_rate=CELL_FIRE_RATE,
                     nutrients_enabled=nutrients_enabled,
                 )
+                now_alive = self._state[0, CH_ALPHA] > 0.1
+                if int(now_alive.sum().item()) > MAX_CELLS:
+                    new_cells = now_alive & ~was_alive
+                    if new_cells.any():
+                        self._state[0, :, new_cells] = 0.0
         self._step_count += n
         self._dirty = True
 
@@ -345,8 +365,9 @@ class SpeciesViewer:
         x: int = 0,
         y: int = 0,
         show_nutrients: bool = False,
+        gravity_enabled: bool = False,
     ) -> None:
-        """Blit the current frame onto *target*, optionally with nutrient overlay."""
+        """Blit the current frame onto *target*, optionally with nutrient/integrity overlay."""
         if self._dirty:
             self._rebuild_surface()
         if self._surface is not None:
@@ -354,9 +375,12 @@ class SpeciesViewer:
         if show_nutrients:
             overlay = build_nutrient_overlay(self.env_state, self.cell_size)
             target.blit(overlay, (x, y))
-            # Also show plant cell health
+            # Show integrity overlay when gravity is on, otherwise nutrient health
             if self._state is not None:
-                health_ov = build_plant_health_overlay(self._state[0], self.cell_size)
+                health_ov = build_plant_health_overlay(
+                    self._state[0], self.cell_size,
+                    show_integrity=gravity_enabled,
+                )
                 target.blit(health_ov, (x, y))
 
     # ------------------------------------------------------------------
@@ -368,15 +392,16 @@ class SpeciesViewer:
         return self._step_count
 
     def plant_stats(self) -> dict:
-        """Return stats about alive plant cells and their nutrient levels."""
+        """Return stats about alive plant cells and their nutrient/integrity levels."""
         if self._state is None:
-            return {'alive': 0, 'avg_earth': 0.0, 'avg_air': 0.0}
+            return {'alive': 0, 'avg_earth': 0.0, 'avg_air': 0.0, 'avg_integrity': 0.0}
         with torch.no_grad():
             t = self._state[0]
             alive = t[CH_ALPHA] > 0.1
             n_alive = int(alive.sum().item())
             if n_alive == 0:
-                return {'alive': 0, 'avg_earth': 0.0, 'avg_air': 0.0}
+                return {'alive': 0, 'avg_earth': 0.0, 'avg_air': 0.0, 'avg_integrity': 0.0}
             avg_e = float(t[CH_EARTH][alive].mean().item())
             avg_a = float(t[CH_AIR][alive].mean().item())
-            return {'alive': n_alive, 'avg_earth': avg_e, 'avg_air': avg_a}
+            avg_i = float(t[CH_INTEGRITY][alive].mean().item())
+            return {'alive': n_alive, 'avg_earth': avg_e, 'avg_air': avg_a, 'avg_integrity': avg_i}

@@ -62,11 +62,29 @@ N_TRAINING_STEPS   = 10000
 # ---------------------------------------------------------------------------
 # Energy system (plant nutrient absorption / dissipation / death)
 # ---------------------------------------------------------------------------
-ABSORPTION_RATE    = 0.05     # nutrients absorbed per step by root/leaf cells
-DISSIPATION_RATE   = 0.002    # nutrients lost per step per alive cell (maintenance)
-DEATH_THRESHOLD    = 0.01     # cell dies if BOTH earth AND air drop below this
-NUTRIENTS_ENABLED  = False    # False = phase-1 (channels 4-5 clamped to 1.0)
-ROOT_LOSS_MASK     = True     # exclude root cells from shape loss during training
+ABSORPTION_RATE       = 0.05     # nutrients absorbed per step by root/leaf cells
+DISSIPATION_RATE      = 0.002    # nutrients lost per step per alive cell (maintenance)
+DEATH_THRESHOLD       = 0.01     # cell dies based on cell-type-specific rules
+NUTRIENTS_ENABLED     = False    # False = phase-1 (channels 4-5 clamped to 1.0)
+ROOT_LOSS_MASK        = True     # exclude root cells from shape loss during training
+NUTRIENT_TRANSPORT_RATE = 0.20   # fraction of nutrients shared with poorer neighbours
+NUTRIENT_TRANSPORT_STEPS = 2     # transport passes per simulation step
+
+# ---------------------------------------------------------------------------
+# Structural integrity and gravity
+# ---------------------------------------------------------------------------
+INTEGRITY_DECAY_ROOT  = 1.0    # integrity lost per hop for root cells
+INTEGRITY_DECAY_STEM  = 2.0    # integrity lost per hop for stem cells
+INTEGRITY_DECAY_LEAF  = 3.0    # integrity lost per hop for leaf cells
+INTEGRITY_SOIL        = 50.0   # integrity provided by ENV_SOIL
+INTEGRITY_ROCK        = 100.0  # integrity provided by ENV_ROCK
+INTEGRITY_STEPS       = 3      # propagation passes per simulation step
+GRAVITY_ENABLED       = False  # False = phase-1 (plants float freely)
+
+# ---------------------------------------------------------------------------
+# Growth cap
+# ---------------------------------------------------------------------------
+MAX_CELLS             = 800    # max alive cells per species; new cells reverted above this
 
 # ---------------------------------------------------------------------------
 # Seed positions  (row, col) — index 0 is the bottom cell (future root zone)

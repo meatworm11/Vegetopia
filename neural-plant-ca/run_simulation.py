@@ -20,6 +20,7 @@ Controls
     R            reset all simulations
     D            toggle nutrient debug overlay
     E            toggle energy system (nutrients_enabled)
+    G            toggle gravity (structural integrity + falling)
     +  /  =      speed up  (more NCA steps per frame)
     -            slow down (fewer NCA steps per frame)
     Q / Escape   quit
@@ -36,12 +37,14 @@ import torch
 
 from config import (
     SIM_GRID_H, SIM_GRID_W, CELL_RENDER_SIZE, N_CHANNELS,
-    NUTRIENTS_ENABLED,
+    NUTRIENTS_ENABLED, GRAVITY_ENABLED,
+    NUTRIENT_TRANSPORT_STEPS, INTEGRITY_STEPS,
 )
 from environment import (
     create_environment, soil_surface_row,
     EnvironmentState, regenerate_sources, diffuse_nutrients,
     plant_absorb_nutrients, plant_dissipate_energy, plant_death_check,
+    transport_nutrients, update_structural_integrity, apply_gravity,
 )
 from model import NCA
 from viewer import SpeciesViewer
@@ -181,6 +184,7 @@ def run_viewer(species_names: list[str]) -> None:
     paused             = False
     show_nutrients     = False
     nutrients_enabled  = NUTRIENTS_ENABLED
+    gravity_enabled    = GRAVITY_ENABLED
     running            = True
 
     def _hit_viewer(mx: int, my: int):
@@ -206,13 +210,18 @@ def run_viewer(species_names: list[str]) -> None:
                     paused = not paused
 
                 elif ev.key == pygame.K_s and paused:
-                    # Single step: advance NCA + nutrients + energy
+                    # Single step: advance all systems
                     regenerate_sources(env_state)
                     diffuse_nutrients(env_state, n_steps=DIFFUSION_SUBSTEPS)
                     if nutrients_enabled:
                         for v in viewers:
                             plant_absorb_nutrients(v._state, env_state)
                             plant_dissipate_energy(v._state)
+                            transport_nutrients(v._state, n_steps=NUTRIENT_TRANSPORT_STEPS)
+                    if gravity_enabled:
+                        for v in viewers:
+                            update_structural_integrity(v._state, env_state.env_type_grid, n_steps=INTEGRITY_STEPS)
+                            apply_gravity(v._state, env_state.env_type_grid)
                     for v in viewers:
                         v.step(1, nutrients_enabled=nutrients_enabled)
                     if nutrients_enabled:
@@ -229,6 +238,10 @@ def run_viewer(species_names: list[str]) -> None:
                 elif ev.key == pygame.K_e:
                     nutrients_enabled = not nutrients_enabled
                     print(f"Energy system: {'ON' if nutrients_enabled else 'OFF'}")
+
+                elif ev.key == pygame.K_g:
+                    gravity_enabled = not gravity_enabled
+                    print(f"Gravity: {'ON' if gravity_enabled else 'OFF'}")
 
                 elif ev.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     steps_per_frame = min(steps_per_frame * 2, MAX_STEPS_FRAME)
@@ -257,6 +270,13 @@ def run_viewer(species_names: list[str]) -> None:
                 for v in viewers:
                     plant_absorb_nutrients(v._state, env_state)
                     plant_dissipate_energy(v._state)
+                    transport_nutrients(v._state, n_steps=NUTRIENT_TRANSPORT_STEPS)
+
+            # Structural integrity + gravity
+            if gravity_enabled:
+                for v in viewers:
+                    update_structural_integrity(v._state, env_state.env_type_grid, n_steps=INTEGRITY_STEPS)
+                    apply_gravity(v._state, env_state.env_type_grid)
 
             # NCA step(s)
             for v in viewers:
@@ -271,28 +291,33 @@ def run_viewer(species_names: list[str]) -> None:
         screen.fill(BG_COLOUR)
 
         for v in viewers:
-            v.draw(screen, panel_x, panel_top, show_nutrients=show_nutrients)
+            v.draw(screen, panel_x, panel_top, show_nutrients=show_nutrients,
+                   gravity_enabled=gravity_enabled)
 
         # Species labels + plant stats
         label_y = panel_top + SIM_GRID_H * CELL_RENDER_SIZE + 4
         stat_parts = []
         for v in viewers:
             s = v.plant_stats()
-            stat_parts.append(
+            base = (
                 f'{v.name}:{v.step_count:,}  '
                 f'alive={s["alive"]}  '
                 f'earth={s["avg_earth"]:.2f}  air={s["avg_air"]:.2f}'
             )
+            if gravity_enabled:
+                base += f'  integ={s["avg_integrity"]:.1f}'
+            stat_parts.append(base)
         label = font.render('  |  '.join(stat_parts), True, LABEL_COLOUR)
         screen.blit(label, (PANEL_PADDING, label_y))
 
         # Status bar
-        pause_str  = 'PAUSED' if paused else 'running'
-        nutr_str   = ' [overlay ON]' if show_nutrients else ''
-        energy_str = ' [ENERGY ON]' if nutrients_enabled else ' [energy OFF]'
+        pause_str   = 'PAUSED' if paused else 'running'
+        nutr_str    = ' [overlay ON]' if show_nutrients else ''
+        energy_str  = ' [ENERGY ON]' if nutrients_enabled else ' [energy OFF]'
+        grav_str    = ' [GRAVITY ON]' if gravity_enabled else ''
         spd_label = font.render(
-            f'{pause_str}  speed: {steps_per_frame}×{energy_str}{nutr_str}  |  '
-            f'Space=pause  S=step  R=reset  D=overlay  E=energy  Q=quit',
+            f'{pause_str}  speed: {steps_per_frame}×{energy_str}{grav_str}{nutr_str}  |  '
+            f'Space=pause  S=step  R=reset  D=overlay  E=energy  G=gravity  Q=quit',
             True, (120, 120, 120),
         )
         screen.blit(spd_label, (PANEL_PADDING, 4))

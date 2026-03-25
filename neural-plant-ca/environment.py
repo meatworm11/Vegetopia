@@ -25,8 +25,11 @@ import torch.nn.functional as F
 
 from config import (
     ENV_EMPTY, ENV_SOIL, ENV_ROCK, ENV_SUN,
-    CH_ALPHA, CH_EARTH, CH_AIR, CH_CELL_TYPE,
+    CH_ALPHA, CH_EARTH, CH_AIR, CH_CELL_TYPE, CH_INTEGRITY,
     ABSORPTION_RATE, DISSIPATION_RATE, DEATH_THRESHOLD,
+    NUTRIENT_TRANSPORT_RATE,
+    INTEGRITY_DECAY_ROOT, INTEGRITY_DECAY_STEM, INTEGRITY_DECAY_LEAF,
+    INTEGRITY_SOIL, INTEGRITY_ROCK,
 )
 
 # Nutrient channel indices
@@ -280,12 +283,199 @@ def plant_dissipate_energy(plant_grid: torch.Tensor) -> None:
 
 def plant_death_check(plant_grid: torch.Tensor) -> None:
     """
-    Kill any cell where BOTH earth AND air nutrients are below DEATH_THRESHOLD.
+    Cell-type-specific death conditions:
+      - Root  (≈0.25): dies if earth < threshold
+      - Stem  (≈0.50): dies if earth < threshold
+      - Leaf  (≈0.75): dies if earth OR air < threshold
+      - Flower(≈1.00): dies if earth OR air < threshold
+      - Unspecialized:  dies if BOTH earth AND air < threshold (legacy rule)
     """
     with torch.no_grad():
-        alive  = plant_grid[0, CH_ALPHA] > 0.1
-        low_e  = plant_grid[0, CH_EARTH] < DEATH_THRESHOLD
-        low_a  = plant_grid[0, CH_AIR]   < DEATH_THRESHOLD
-        dying  = alive & low_e & low_a                        # (H, W)
+        alive = plant_grid[0, CH_ALPHA] > 0.1
+        ctype = plant_grid[0, CH_CELL_TYPE]
+        low_e = plant_grid[0, CH_EARTH] < DEATH_THRESHOLD
+        low_a = plant_grid[0, CH_AIR]   < DEATH_THRESHOLD
+
+        is_root   = alive & (ctype > 0.10) & (ctype < 0.40)
+        is_stem   = alive & (ctype > 0.40) & (ctype < 0.60)
+        is_leaf   = alive & (ctype > 0.60) & (ctype < 0.90)
+        is_flower = alive & (ctype > 0.90)
+        is_other  = alive & ~is_root & ~is_stem & ~is_leaf & ~is_flower
+
+        dying = (
+            (is_root & low_e)
+            | (is_stem & low_e)
+            | (is_leaf & (low_e | low_a))
+            | (is_flower & (low_e | low_a))
+            | (is_other & low_e & low_a)
+        )
         if dying.any():
             plant_grid[0, :, dying] = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Nutrient transport between plant cells
+# ---------------------------------------------------------------------------
+
+def transport_nutrients(plant_grid: torch.Tensor, n_steps: int = 1) -> None:
+    """
+    Each alive plant cell shares NUTRIENT_TRANSPORT_RATE of its nutrients with
+    neighbouring alive cells that have less of that nutrient.
+
+    This creates flow: roots pass earth up through stems to leaves,
+    leaves pass air down through stems to roots.
+
+    plant_grid shape: (1, C, H, W)
+    """
+    with torch.no_grad():
+        for _ in range(n_steps):
+            alive = (plant_grid[0, CH_ALPHA] > 0.1).float()  # (H, W)
+
+            for ch in (CH_EARTH, CH_AIR):
+                vals = plant_grid[0, ch]  # (H, W)
+
+                # Pad with zeros (non-alive boundary)
+                padded = F.pad(vals.unsqueeze(0).unsqueeze(0),
+                               (1, 1, 1, 1), mode='constant', value=0)
+                alive_padded = F.pad(alive.unsqueeze(0).unsqueeze(0),
+                                     (1, 1, 1, 1), mode='constant', value=0)
+
+                # 4 cardinal neighbours
+                neighbours = [
+                    padded[:, :, 0:-2, 1:-1],  # up
+                    padded[:, :, 2:,   1:-1],  # down
+                    padded[:, :, 1:-1, 0:-2],  # left
+                    padded[:, :, 1:-1, 2:],    # right
+                ]
+                alive_nb = [
+                    alive_padded[:, :, 0:-2, 1:-1],
+                    alive_padded[:, :, 2:,   1:-1],
+                    alive_padded[:, :, 1:-1, 0:-2],
+                    alive_padded[:, :, 1:-1, 2:],
+                ]
+
+                vals_4d = vals.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+
+                # Accumulate donation to neighbours and reception from neighbours
+                total_give = torch.zeros_like(vals)
+                total_recv = torch.zeros_like(vals)
+
+                for nb_val, nb_alive in zip(neighbours, alive_nb):
+                    # This cell gives to neighbour if neighbour is alive and has less
+                    diff = vals_4d - nb_val  # positive = we have more
+                    give_mask = (diff > 0) & (alive.unsqueeze(0).unsqueeze(0) > 0) & (nb_alive > 0)
+                    give = diff * NUTRIENT_TRANSPORT_RATE * give_mask.float()
+                    total_give += give.squeeze(0).squeeze(0)
+
+                    # This cell receives from neighbour (neighbour has more)
+                    recv_mask = (diff < 0) & (alive.unsqueeze(0).unsqueeze(0) > 0) & (nb_alive > 0)
+                    recv = (-diff) * NUTRIENT_TRANSPORT_RATE * recv_mask.float()
+                    total_recv += recv.squeeze(0).squeeze(0)
+
+                plant_grid[0, ch] = (vals - total_give + total_recv).clamp(0, 1)
+
+
+# ---------------------------------------------------------------------------
+# Structural integrity
+# ---------------------------------------------------------------------------
+
+def update_structural_integrity(
+    plant_grid: torch.Tensor,
+    env_type_grid: np.ndarray,
+    n_steps: int = 1,
+) -> None:
+    """
+    Propagate structural integrity through plant cells.
+
+    - ENV_ROCK cells provide integrity=10.0
+    - ENV_SOIL cells provide integrity=5.0
+    - Each alive plant cell inherits MAX integrity from 3×3 neighbourhood minus
+      a cell-type-dependent decay (root=1.0, stem=2.0, leaf=3.0).
+    - Run multiple passes per step for faster percolation.
+
+    plant_grid shape: (1, C, H, W)
+    """
+    with torch.no_grad():
+        h, w = plant_grid.shape[2], plant_grid.shape[3]
+        device = plant_grid.device
+        env_t = torch.from_numpy(env_type_grid).to(device)
+
+        alive = plant_grid[0, CH_ALPHA] > 0.1  # (H, W)
+        ctype = plant_grid[0, CH_CELL_TYPE]     # (H, W)
+
+        # Compute per-cell decay based on cell type
+        decay = torch.full((h, w), 3.0, device=device)  # default = leaf decay
+        is_root = (ctype > 0.10) & (ctype < 0.40)
+        is_stem = (ctype > 0.40) & (ctype < 0.60)
+        is_leaf = (ctype > 0.60) & (ctype < 0.90)
+        decay[is_root] = INTEGRITY_DECAY_ROOT
+        decay[is_stem] = INTEGRITY_DECAY_STEM
+        decay[is_leaf] = INTEGRITY_DECAY_LEAF
+
+        # Ground integrity sources
+        ground_integrity = torch.zeros(h, w, device=device)
+        ground_integrity[env_t == ENV_ROCK] = INTEGRITY_ROCK
+        ground_integrity[env_t == ENV_SOIL] = INTEGRITY_SOIL
+
+        for _ in range(n_steps):
+            integrity = plant_grid[0, CH_INTEGRITY]  # (H, W)
+
+            # Start with ground sources (always reset)
+            integrity = torch.where(
+                (env_t == ENV_ROCK) | (env_t == ENV_SOIL),
+                ground_integrity,
+                integrity,
+            )
+
+            # Max-pool 3×3 to find max integrity in neighbourhood
+            int_4d = integrity.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+            max_nb = F.max_pool2d(
+                F.pad(int_4d, (1, 1, 1, 1), mode='constant', value=0),
+                kernel_size=3, stride=1, padding=0,
+            ).squeeze(0).squeeze(0)  # (H, W)
+
+            # Each alive cell gets max_neighbour - decay
+            new_integrity = (max_nb - decay).clamp(min=0)
+
+            # Only alive plant cells get integrity; dead cells = 0
+            plant_grid[0, CH_INTEGRITY] = new_integrity * alive.float()
+
+
+# ---------------------------------------------------------------------------
+# Gravity
+# ---------------------------------------------------------------------------
+
+def apply_gravity(
+    plant_grid: torch.Tensor,
+    env_type_grid: np.ndarray,
+) -> None:
+    """
+    Any alive plant cell with structural integrity <= 0.0 AND with an empty cell
+    below it (ENV_EMPTY, no plant) falls one cell down.
+
+    Process bottom-to-top so a column of unsupported cells falls together.
+    Cells on soil or on other plant cells with positive integrity don't fall.
+
+    plant_grid shape: (1, C, H, W)
+    """
+    with torch.no_grad():
+        h, w = plant_grid.shape[2], plant_grid.shape[3]
+        device = plant_grid.device
+        env_t = torch.from_numpy(env_type_grid).to(device)
+
+        # Process from second-to-last row up to row 0 (bottom to top)
+        for r in range(h - 2, -1, -1):
+            alive_row = plant_grid[0, CH_ALPHA, r] > 0.1         # (W,) bool
+            low_integrity = plant_grid[0, CH_INTEGRITY, r] <= 0.0  # (W,) bool
+
+            # Below must be empty terrain AND no plant cell there
+            below_empty_terrain = (env_t[r + 1] == ENV_EMPTY) | (env_t[r + 1] == ENV_SUN)
+            below_no_plant = plant_grid[0, CH_ALPHA, r + 1] <= 0.1
+
+            can_fall = alive_row & low_integrity & below_empty_terrain & below_no_plant
+
+            if can_fall.any():
+                cols = can_fall.nonzero(as_tuple=True)[0]
+                # Copy state vector down, zero original
+                plant_grid[0, :, r + 1, cols] = plant_grid[0, :, r, cols]
+                plant_grid[0, :, r, cols] = 0.0
