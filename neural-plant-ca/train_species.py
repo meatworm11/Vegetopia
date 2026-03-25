@@ -60,9 +60,17 @@ def main() -> None:
     parser.add_argument(
         '--curriculum', action='store_true',
         help='Staged training (requires --energy): '
-             'A (1-3000) clamped nutrients + new losses, '
-             'B (3001-6000) gentle energy rates, '
-             'C (6001+) full energy rates',
+             'A (1-phase_a) clamped nutrients + new losses, '
+             'B (phase_a+1-phase_b) gentle energy rates, '
+             'C (phase_b+1+) full energy rates',
+    )
+    parser.add_argument(
+        '--phase-a', dest='phase_a', type=int, default=1000, metavar='STEP',
+        help='Last step of curriculum phase A (clamped nutrients)',
+    )
+    parser.add_argument(
+        '--phase-b', dest='phase_b', type=int, default=3000, metavar='STEP',
+        help='Last step of curriculum phase B (gentle energy rates)',
     )
     parser.add_argument(
         '--init-from', dest='init_from', default=None, metavar='PATH',
@@ -94,7 +102,10 @@ def main() -> None:
     print(f"  Device    : {device}")
     print(f"  Seed      : {args.seed if args.seed is not None else 'random'}")
     print(f"  Energy    : {'ON' if args.energy else 'OFF'}")
-    print(f"  Curriculum: {'ON' if args.curriculum else 'OFF'}")
+    if args.curriculum:
+        print(f"  Curriculum: A(1-{args.phase_a}) B({args.phase_a+1}-{args.phase_b}) C({args.phase_b+1}+)")
+    else:
+        print(f"  Curriculum: OFF")
     print(f"  Init from : {args.init_from or '(scratch)'}")
     print(f"  LR        : {lr}")
     print("=" * 50)
@@ -132,6 +143,8 @@ def main() -> None:
         device=device,
         energy=args.energy,
         curriculum=args.curriculum,
+        phase_a_end=args.phase_a,
+        phase_b_end=args.phase_b,
         lr=lr,
     )
 

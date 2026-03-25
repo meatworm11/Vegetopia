@@ -50,21 +50,23 @@ TRAIN_BATCH_SIZE = 4
 # Curriculum phases
 # ---------------------------------------------------------------------------
 
-CURRICULUM_PHASE_A_END = 3000   # clamped nutrients, new loss terms
-CURRICULUM_PHASE_B_END = 6000   # gentle energy rates
+DEFAULT_PHASE_A_END = 1000   # clamped nutrients, new loss terms
+DEFAULT_PHASE_B_END = 3000   # gentle energy rates
 
 # Phase B rates: 10x less dissipation, 2x more absorption
 GENTLE_DISSIPATION = 0.0002
 GENTLE_ABSORPTION  = 0.10
 
 
-def _curriculum_phase(step: int, curriculum: bool) -> str:
+def _curriculum_phase(step: int, curriculum: bool,
+                      phase_a_end: int = DEFAULT_PHASE_A_END,
+                      phase_b_end: int = DEFAULT_PHASE_B_END) -> str:
     """Return 'A', 'B', or 'C' based on step and curriculum flag."""
     if not curriculum:
         return 'C'   # full energy when not using curriculum
-    if step <= CURRICULUM_PHASE_A_END:
+    if step <= phase_a_end:
         return 'A'
-    if step <= CURRICULUM_PHASE_B_END:
+    if step <= phase_b_end:
         return 'B'
     return 'C'
 
@@ -201,6 +203,8 @@ def train(
     checkpoint_every: int = 1000,
     energy: bool = False,
     curriculum: bool = False,
+    phase_a_end: int = DEFAULT_PHASE_A_END,
+    phase_b_end: int = DEFAULT_PHASE_B_END,
     lr: float = LEARNING_RATE,
 ) -> NCA:
     """
@@ -216,9 +220,11 @@ def train(
         checkpoint_every : save intermediate .pt checkpoint every N steps
         energy           : if True, run environment physics during unroll
         curriculum       : if True (requires energy), use staged training:
-                           A (1-3000): clamped nutrients + new losses
-                           B (3001-6000): gentle energy rates
-                           C (6001+): full energy rates
+                           A (1-phase_a_end): clamped nutrients + new losses
+                           B (phase_a_end+1 - phase_b_end): gentle energy rates
+                           C (phase_b_end+1+): full energy rates
+        phase_a_end      : last step of curriculum phase A
+        phase_b_end      : last step of curriculum phase B
         lr               : learning rate (default LEARNING_RATE; 5e-4 for fine-tuning)
 
     Returns:
@@ -250,10 +256,10 @@ def train(
         curriculum = False
 
     if curriculum:
-        print(f"Curriculum: A (1-{CURRICULUM_PHASE_A_END}) clamped + new losses")
-        print(f"            B ({CURRICULUM_PHASE_A_END+1}-{CURRICULUM_PHASE_B_END}) "
+        print(f"Curriculum: A (1-{phase_a_end}) clamped + new losses")
+        print(f"            B ({phase_a_end+1}-{phase_b_end}) "
               f"gentle energy (dissip={GENTLE_DISSIPATION}, absorb={GENTLE_ABSORPTION})")
-        print(f"            C ({CURRICULUM_PHASE_B_END+1}+) full energy "
+        print(f"            C ({phase_b_end+1}+) full energy "
               f"(dissip={DISSIPATION_RATE}, absorb={ABSORPTION_RATE})")
 
     # Pool lives on CPU to avoid VRAM pressure; batches are moved to device per step.
@@ -276,7 +282,7 @@ def train(
 
     for step in range(1, n_steps + 1):
 
-        phase = _curriculum_phase(step, curriculum)
+        phase = _curriculum_phase(step, curriculum, phase_a_end, phase_b_end)
 
         # Log phase transitions
         if phase != prev_phase:
