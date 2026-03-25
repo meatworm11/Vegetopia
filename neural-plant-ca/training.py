@@ -234,6 +234,10 @@ def train(
     print(header)
     print("-" * len(header))
 
+    if energy:
+        print("Sources regeneration: DISABLED (finite nutrient pool per rollout)")
+        print("NCA nutrient override: DISABLED (channels 4-5 preserved from input)")
+
     t0           = time.time()
     loss_history = []
 

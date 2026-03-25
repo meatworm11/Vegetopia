@@ -185,9 +185,10 @@ class NCA(nn.Module):
         )
 
         if nutrients_enabled:
-            # Energy system active: let earth/air pass through (clamped to [0,1])
-            earth_ch = new_x[:, 4:5].clamp(0.0, 1.0)
-            air_ch   = new_x[:, 5:6].clamp(0.0, 1.0)
+            # Energy system active: preserve input nutrient levels — the NCA
+            # must not overwrite them (environment physics manages channels 4-5).
+            earth_ch = x[:, 4:5]
+            air_ch   = x[:, 5:6]
         else:
             # Phase-1 / training: unlimited nutrients
             earth_ch = torch.ones_like(new_x[:, 4:5])
