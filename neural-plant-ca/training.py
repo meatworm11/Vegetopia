@@ -330,6 +330,20 @@ def train(
                         plant_dissipate_energy(sample, rate=step_dissip)
                         plant_death_check(sample)
 
+        # --- Debug: nutrient levels after unroll -----------------------------------
+        if step_energy and step % 100 == 0:
+            with torch.no_grad():
+                s = x[0]  # first batch item: (C, H, W)
+                alive = s[CH_ALPHA] > 0.1
+                if alive.any():
+                    earth_alive = s[CH_EARTH][alive]
+                    air_alive   = s[CH_AIR][alive]
+                    print(f"  [nutrient debug] alive={int(alive.sum())}  "
+                          f"earth: min={earth_alive.min():.4f} max={earth_alive.max():.4f} mean={earth_alive.mean():.4f}  "
+                          f"air: min={air_alive.min():.4f} max={air_alive.max():.4f} mean={air_alive.mean():.4f}")
+                else:
+                    print(f"  [nutrient debug] no alive cells")
+
         # --- Loss ---------------------------------------------------------------
         # Energy health loss active when energy flag is set (all curriculum phases)
         total, shape_l, type_l, overflow_l, bg_l, stem_l, energy_l = _compute_loss(
