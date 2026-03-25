@@ -227,6 +227,7 @@ def diffuse_nutrients(state: EnvironmentState, n_steps: int = 1) -> None:
 def plant_absorb_nutrients(
     plant_grid: torch.Tensor,
     state: EnvironmentState,
+    rate: float | None = None,
 ) -> None:
     """
     Alive root cells absorb earth nutrients; alive leaf cells absorb air nutrients.
@@ -234,10 +235,10 @@ def plant_absorb_nutrients(
     plant_grid shape: (1, C, H, W)  — the NCA state tensor.
     Modifies plant_grid channels 4-5 and state.nutrient_grid in-place.
 
-    Cell type matching (channel 9, ±0.15 tolerance):
-        root: 0.10 – 0.40   →  absorb earth
-        leaf: 0.60 – 0.90   →  absorb air
+    Args:
+        rate: absorption rate override (default: ABSORPTION_RATE from config)
     """
+    abs_rate = rate if rate is not None else ABSORPTION_RATE
     with torch.no_grad():
         alive = plant_grid[0, CH_ALPHA] > 0.1                # (H, W) bool
         ctype = plant_grid[0, CH_CELL_TYPE]                   # (H, W)
@@ -249,7 +250,7 @@ def plant_absorb_nutrients(
             available = env_earth * is_root.float()
             absorbed  = torch.minimum(
                 available,
-                torch.full_like(available, ABSORPTION_RATE),
+                torch.full_like(available, abs_rate),
             )
             state.nutrient_grid[NUTRIENT_EARTH] = env_earth - absorbed
             plant_grid[0, CH_EARTH] = (plant_grid[0, CH_EARTH] + absorbed).clamp(0, 1)
@@ -261,23 +262,30 @@ def plant_absorb_nutrients(
             available = env_air * is_leaf.float()
             absorbed  = torch.minimum(
                 available,
-                torch.full_like(available, ABSORPTION_RATE),
+                torch.full_like(available, abs_rate),
             )
             state.nutrient_grid[NUTRIENT_AIR] = env_air - absorbed
             plant_grid[0, CH_AIR] = (plant_grid[0, CH_AIR] + absorbed).clamp(0, 1)
 
 
-def plant_dissipate_energy(plant_grid: torch.Tensor) -> None:
+def plant_dissipate_energy(
+    plant_grid: torch.Tensor,
+    rate: float | None = None,
+) -> None:
     """
     Every alive cell loses a small amount of both nutrients per step (maintenance).
+
+    Args:
+        rate: dissipation rate override (default: DISSIPATION_RATE from config)
     """
+    dissip_rate = rate if rate is not None else DISSIPATION_RATE
     with torch.no_grad():
         alive = (plant_grid[0, CH_ALPHA] > 0.1).float()      # (H, W)
         plant_grid[0, CH_EARTH] = (
-            plant_grid[0, CH_EARTH] - DISSIPATION_RATE * alive
+            plant_grid[0, CH_EARTH] - dissip_rate * alive
         ).clamp(0)
         plant_grid[0, CH_AIR] = (
-            plant_grid[0, CH_AIR] - DISSIPATION_RATE * alive
+            plant_grid[0, CH_AIR] - dissip_rate * alive
         ).clamp(0)
 
 

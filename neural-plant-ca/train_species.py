@@ -6,8 +6,8 @@ Usage:
     python train_species.py --name pine --preset pine --steps 5000 --seed 7
     python train_species.py --name oak --steps 2000 --device cpu   # smoke test
 
-    # Energy-aware fine-tuning from a pretrained model:
-    python train_species.py --name oak_v2 --preset oak --steps 10000 --energy --init-from species/oak.pt
+    # Energy-aware fine-tuning with curriculum from a pretrained model:
+    python train_species.py --name oak_v2 --preset oak --steps 10000 --energy --curriculum --init-from species/oak.pt
 """
 
 import argparse
@@ -58,6 +58,13 @@ def main() -> None:
              'run during unroll, survival bonus in loss',
     )
     parser.add_argument(
+        '--curriculum', action='store_true',
+        help='Staged training (requires --energy): '
+             'A (1-3000) clamped nutrients + new losses, '
+             'B (3001-6000) gentle energy rates, '
+             'C (6001+) full energy rates',
+    )
+    parser.add_argument(
         '--init-from', dest='init_from', default=None, metavar='PATH',
         help='Load pretrained weights from a checkpoint file as starting point. '
              'Uses LR 5e-4 for fine-tuning unless --lr is specified.',
@@ -87,6 +94,7 @@ def main() -> None:
     print(f"  Device    : {device}")
     print(f"  Seed      : {args.seed if args.seed is not None else 'random'}")
     print(f"  Energy    : {'ON' if args.energy else 'OFF'}")
+    print(f"  Curriculum: {'ON' if args.curriculum else 'OFF'}")
     print(f"  Init from : {args.init_from or '(scratch)'}")
     print(f"  LR        : {lr}")
     print("=" * 50)
@@ -123,6 +131,7 @@ def main() -> None:
         n_steps=args.steps,
         device=device,
         energy=args.energy,
+        curriculum=args.curriculum,
         lr=lr,
     )
 

@@ -13,6 +13,13 @@ Energy-aware mode (energy=True):
   - Each NCA step is followed by environment physics: diffusion, absorption,
     transport, dissipation, and death check
   - A survival bonus rewards keeping cells alive
+
+Curriculum mode (curriculum=True, requires energy=True):
+  - Phase A (steps 1-3000): nutrients clamped (phase-1 style), but new loss
+    terms active (root masking, stem colour, survival bonus by cell count)
+  - Phase B (steps 3001-6000): energy ON with gentle rates
+    (dissipation 0.0002, absorption 0.1)
+  - Phase C (steps 6001+): full energy rates
 """
 
 import time
@@ -26,13 +33,40 @@ import torch
 import torch.nn.functional as F
 
 from config import (
-    BATCH_SIZE, CELL_FIRE_RATE, LEARNING_RATE,
+    CELL_FIRE_RATE, LEARNING_RATE,
     N_CHANNELS, POOL_SIZE, TRAIN_STEPS_RANGE, DEVICE,
     GRID_H, GRID_W,
     CH_ALPHA, CH_CELL_TYPE, ROOT_LOSS_MASK,
     NUTRIENT_TRANSPORT_STEPS,
+    ABSORPTION_RATE, DISSIPATION_RATE,
 )
 from model import NCA, make_seed
+
+# Training batch size — smaller than simulation for speed
+TRAIN_BATCH_SIZE = 4
+
+
+# ---------------------------------------------------------------------------
+# Curriculum phases
+# ---------------------------------------------------------------------------
+
+CURRICULUM_PHASE_A_END = 3000   # clamped nutrients, new loss terms
+CURRICULUM_PHASE_B_END = 6000   # gentle energy rates
+
+# Phase B rates: 10x less dissipation, 2x more absorption
+GENTLE_DISSIPATION = 0.0002
+GENTLE_ABSORPTION  = 0.10
+
+
+def _curriculum_phase(step: int, curriculum: bool) -> str:
+    """Return 'A', 'B', or 'C' based on step and curriculum flag."""
+    if not curriculum:
+        return 'C'   # full energy when not using curriculum
+    if step <= CURRICULUM_PHASE_A_END:
+        return 'A'
+    if step <= CURRICULUM_PHASE_B_END:
+        return 'B'
+    return 'C'
 
 
 # ---------------------------------------------------------------------------
@@ -46,12 +80,13 @@ _STEM_BROWN = torch.tensor([0.45, 0.30, 0.15]).view(3, 1, 1)
 def _compute_loss(
     output: torch.Tensor,
     target: torch.Tensor,
-    energy: bool = False,
+    survival_bonus: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Return (total_loss, shape_loss, type_loss, overflow_loss, bg_loss, stem_loss).
 
     target shape: (N_CHANNELS, H, W) — broadcast over batch automatically.
+    survival_bonus: if True, add -0.001 * alive_count to encourage keeping cells alive.
     """
     tgt = target.unsqueeze(0)   # (1, C, H, W) — broadcasts to batch
 
@@ -83,7 +118,6 @@ def _compute_loss(
     bg_loss = (output[:, 3:4] * (1.0 - target_alpha_mask)).mean()
 
     # --- Stem colour consistency loss ---
-    # Push alive stem cells (type ≈ 0.5) toward brown RGB
     out_ctype = output[:, CH_CELL_TYPE:CH_CELL_TYPE + 1]
     is_stem = ((out_ctype - 0.5).abs() < 0.1).float() * alive_mask  # (B,1,H,W)
     stem_target = _STEM_BROWN.to(output.device).unsqueeze(0)         # (1,3,1,1)
@@ -93,11 +127,10 @@ def _compute_loss(
 
     total = shape_loss + 0.1 * type_loss + 0.01 * overflow + 2.0 * bg_loss + 0.1 * stem_loss
 
-    # --- Survival bonus (energy mode only) ---
-    if energy:
+    # --- Survival bonus ---
+    if survival_bonus:
         n_alive = (output[:, CH_ALPHA:CH_ALPHA + 1] > 0.1).float().sum()
-        survival_bonus = -0.001 * n_alive
-        total = total + survival_bonus
+        total = total + (-0.001 * n_alive)
 
     return total, shape_loss, type_loss, overflow, bg_loss, stem_loss
 
@@ -159,6 +192,7 @@ def train(
     snapshot_every: int = 500,
     checkpoint_every: int = 1000,
     energy: bool = False,
+    curriculum: bool = False,
     lr: float = LEARNING_RATE,
 ) -> NCA:
     """
@@ -173,6 +207,10 @@ def train(
         snapshot_every   : save side-by-side image every N steps
         checkpoint_every : save intermediate .pt checkpoint every N steps
         energy           : if True, run environment physics during unroll
+        curriculum       : if True (requires energy), use staged training:
+                           A (1-3000): clamped nutrients + new losses
+                           B (3001-6000): gentle energy rates
+                           C (6001+): full energy rates
         lr               : learning rate (default LEARNING_RATE; 5e-4 for fine-tuning)
 
     Returns:
@@ -199,6 +237,17 @@ def train(
             diffuse_nutrients(env_state, n_steps=5)
         print("  done.")
 
+    if curriculum and not energy:
+        print("WARNING: --curriculum requires --energy. Ignoring --curriculum.")
+        curriculum = False
+
+    if curriculum:
+        print(f"Curriculum: A (1-{CURRICULUM_PHASE_A_END}) clamped + new losses")
+        print(f"            B ({CURRICULUM_PHASE_A_END+1}-{CURRICULUM_PHASE_B_END}) "
+              f"gentle energy (dissip={GENTLE_DISSIPATION}, absorb={GENTLE_ABSORPTION})")
+        print(f"            C ({CURRICULUM_PHASE_B_END+1}+) full energy "
+              f"(dissip={DISSIPATION_RATE}, absorb={ABSORPTION_RATE})")
+
     # Pool lives on CPU to avoid VRAM pressure; batches are moved to device per step.
     seed_cpu = make_seed(1, device=torch.device('cpu'))            # (1, C, H, W)
     pool     = seed_cpu.expand(POOL_SIZE, -1, -1, -1).clone()     # (POOL_SIZE, C, H, W)
@@ -207,22 +256,42 @@ def train(
     rng       = np.random.default_rng()
 
     header = (
-        f"{'Step':>6}  {'Loss':>9}  {'Shape':>9}  {'Type':>7}  "
-        f"{'OFlow':>7}  {'BgLoss':>7}  {'Stem':>7}  {'Elapsed':>7}  ETA"
+        f"{'Step':>6}  {'Ph':>2}  {'Loss':>9}  {'Shape':>9}  {'Type':>7}  "
+        f"{'OFlow':>7}  {'BgLoss':>7}  {'Stem':>7}  {'Alive':>5}  {'Elapsed':>7}  ETA"
     )
     print(header)
     print("-" * len(header))
 
     t0           = time.time()
     loss_history = []
+    prev_phase   = None
 
     for step in range(1, n_steps + 1):
 
+        phase = _curriculum_phase(step, curriculum)
+
+        # Log phase transitions
+        if phase != prev_phase:
+            if prev_phase is not None:
+                print(f"  >>> Phase {prev_phase} → {phase} at step {step}")
+            prev_phase = phase
+
+        # Determine whether this step uses energy physics
+        step_energy = energy and (phase != 'A')
+
+        # Determine absorption/dissipation rates for this step
+        if phase == 'B':
+            step_absorb  = GENTLE_ABSORPTION
+            step_dissip  = GENTLE_DISSIPATION
+        else:
+            step_absorb  = ABSORPTION_RATE
+            step_dissip  = DISSIPATION_RATE
+
         # --- Sample batch -------------------------------------------------------
-        indices = rng.choice(POOL_SIZE, size=BATCH_SIZE, replace=False)
+        indices = rng.choice(POOL_SIZE, size=TRAIN_BATCH_SIZE, replace=False)
         batch   = pool[indices].to(device)
 
-        # Replace the highest-loss sample with a fresh seed (prevents degenerate states)
+        # Replace the highest-loss sample with a fresh seed
         with torch.no_grad():
             per_sample = _per_sample_loss(batch, target)
         worst        = int(per_sample.argmax().item())
@@ -232,24 +301,25 @@ def train(
         n_nca = int(rng.integers(TRAIN_STEPS_RANGE[0], TRAIN_STEPS_RANGE[1] + 1))
         x     = batch
         for _ in range(n_nca):
-            x = model(x, fire_rate=CELL_FIRE_RATE, nutrients_enabled=energy)
+            x = model(x, fire_rate=CELL_FIRE_RATE, nutrients_enabled=step_energy)
 
             # Energy-aware: run environment physics after each NCA step
-            if energy:
+            if step_energy:
                 with torch.no_grad():
                     regenerate_sources(env_state)
-                    diffuse_nutrients(env_state, n_steps=2)
-                    # Process each sample in the batch individually
+                    diffuse_nutrients(env_state, n_steps=1)
                     for b in range(x.shape[0]):
                         sample = x[b:b+1]  # (1, C, H, W)
-                        plant_absorb_nutrients(sample, env_state)
+                        plant_absorb_nutrients(sample, env_state,
+                                               rate=step_absorb)
                         transport_nutrients(sample, n_steps=NUTRIENT_TRANSPORT_STEPS)
-                        plant_dissipate_energy(sample)
+                        plant_dissipate_energy(sample, rate=step_dissip)
                         plant_death_check(sample)
 
         # --- Loss ---------------------------------------------------------------
+        # Survival bonus always active when energy flag is set (all curriculum phases)
         total, shape_l, type_l, overflow_l, bg_l, stem_l = _compute_loss(
-            x, target, energy=energy,
+            x, target, survival_bonus=energy,
         )
 
         # --- Backward + gradient normalization ----------------------------------
@@ -270,12 +340,14 @@ def train(
         if step % 100 == 0:
             elapsed = time.time() - t0
             eta     = elapsed / step * (n_steps - step)
+            n_alive = int((x[:, CH_ALPHA] > 0.1).float().sum().item())
             print(
-                f"{step:>6,}  {loss_val:>9.5f}  "
+                f"{step:>6,}   {phase}  {loss_val:>9.5f}  "
                 f"{shape_l.item():>9.5f}  {type_l.item():>7.5f}  "
                 f"{overflow_l.item():>7.4f}  "
                 f"{bg_l.item():>7.5f}  "
                 f"{stem_l.item():>7.5f}  "
+                f"{n_alive:>5}  "
                 f"{elapsed:>6.0f}s  {eta:.0f}s"
             )
 
@@ -294,6 +366,7 @@ def train(
                 'name':             name,
                 'loss':             loss_val,
                 'energy':           energy,
+                'curriculum_phase': phase,
             }, ckpt)
             print(f"         [checkpoint] {ckpt}")
 
