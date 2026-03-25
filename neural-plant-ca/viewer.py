@@ -412,6 +412,15 @@ class SpeciesViewer:
     # Rendering
     # ------------------------------------------------------------------
 
+    def set_cell_size(self, cell_size: int) -> None:
+        """Update cell size and invalidate cached surfaces."""
+        self.cell_size = cell_size
+        self.pixel_w = self.grid_w * cell_size
+        self.pixel_h = self.grid_h * cell_size
+        self._bg_surface = None
+        self._surface = None
+        self._dirty = True
+
     def _ensure_bg(self) -> None:
         """Build the environment background surface (once)."""
         if self._bg_surface is None:

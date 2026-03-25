@@ -213,7 +213,8 @@ def run_viewer(species_names: list[str]) -> None:
     pygame.init()
     pygame.display.set_caption('Vegetopia — Neural Plant CA')
 
-    win_w, win_h = _layout(CELL_RENDER_SIZE)
+    cell_size  = CELL_RENDER_SIZE   # mutable — changes on fullscreen toggle
+    win_w, win_h = _layout(cell_size)
     screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
     clock  = pygame.time.Clock()
     fullscreen = False
@@ -231,7 +232,7 @@ def run_viewer(species_names: list[str]) -> None:
             env_state=env_state,
             soil_row=soil_row,
             device=device,
-            cell_size=CELL_RENDER_SIZE,
+            cell_size=cell_size,
         )
         for name in species_names
     ]
@@ -257,8 +258,8 @@ def run_viewer(species_names: list[str]) -> None:
         """Return (local_px, local_py) if cursor is inside the grid panel."""
         lx = mx - panel_x
         ly = my - panel_top
-        pw = SIM_GRID_W * CELL_RENDER_SIZE
-        ph = SIM_GRID_H * CELL_RENDER_SIZE
+        pw = SIM_GRID_W * cell_size
+        ph = SIM_GRID_H * cell_size
         if 0 <= lx < pw and 0 <= ly < ph:
             return lx, ly
         return None
@@ -299,8 +300,20 @@ def run_viewer(species_names: list[str]) -> None:
                     fullscreen = not fullscreen
                     if fullscreen:
                         screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+                        sw, sh = screen.get_size()
+                        # Scale cell size to fill screen, maintaining aspect ratio
+                        cell_size = min(sw // SIM_GRID_W, (sh - STATUS_BAR_HEIGHT) // SIM_GRID_H)
+                        cell_size = max(cell_size, 1)
+                        # Center the grid in the screen
+                        panel_x = (sw - SIM_GRID_W * cell_size) // 2
+                        panel_top = (sh - STATUS_BAR_HEIGHT - SIM_GRID_H * cell_size) // 2
                     else:
+                        cell_size = CELL_RENDER_SIZE
+                        panel_x = PANEL_PADDING
+                        panel_top = PANEL_PADDING
                         screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
+                    for v in viewers:
+                        v.set_cell_size(cell_size)
 
                 elif ev.key in NUM_KEYS:
                     idx = NUM_KEYS[ev.key]
@@ -342,10 +355,10 @@ def run_viewer(species_names: list[str]) -> None:
         hit = _hit_panel(mx, my)
         if hit is not None:
             lx, ly = hit
-            col = lx // CELL_RENDER_SIZE
+            col = lx // cell_size
             ghost = build_ghost_preview(
                 soil_row, col,
-                SIM_GRID_H, SIM_GRID_W, CELL_RENDER_SIZE,
+                SIM_GRID_H, SIM_GRID_W, cell_size,
             )
             screen.blit(ghost, (panel_x, panel_top))
 
@@ -384,7 +397,7 @@ def run_viewer(species_names: list[str]) -> None:
                 for v in viewers
             )
 
-        bar_y = panel_top + SIM_GRID_H * CELL_RENDER_SIZE + 4
+        bar_y = panel_top + SIM_GRID_H * cell_size + 4
         screen.blit(font.render(line1, True, LABEL_COLOUR), (PANEL_PADDING, bar_y))
         screen.blit(font.render(line2, True, DIM_COLOUR), (PANEL_PADDING, bar_y + 16))
 
