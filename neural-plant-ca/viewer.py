@@ -10,10 +10,11 @@ Public API
     SpeciesViewer(name, model, env_state, soil_row, device, cell_size)
         .reset()                   — reinitialise grid from seed
         .step(n)                   — advance n NCA steps
-        .draw(surface, x, y, show_nutrients) — blit frame with optional overlay
+        .draw(surface, x, y, ...) — blit frame with optional overlays
         .place_seed(row, col)      — place a seed (snapped to soil surface)
         .kill_area(row, col)       — zero cells in a 3×3 area
         .pixel_to_grid(px, py)     — screen coords → grid (row, col)
+        .detect_deaths()           — call after death_check to track dying cells
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ def build_env_background(
 
     - ENV_EMPTY / ENV_SUN: sky-blue gradient (lighter at top, darker near ground)
     - ENV_SOIL: brown with per-cell colour variation for texture
-    - ENV_ROCK: dark grey
+    - ENV_ROCK: dark grey-blue, distinct from soil
     """
     h, w = env_grid.shape
     img = np.zeros((h, w, 3), dtype=np.uint8)
@@ -64,7 +65,7 @@ def build_env_background(
                 noise = ((r * 7 + c * 13) % 11) - 5
                 img[r, c] = np.clip(base + noise, 0, 255).astype(np.uint8)
             elif cell == ENV_ROCK:
-                base = np.array([80, 80, 85], dtype=np.int32)
+                base = np.array([70, 72, 82], dtype=np.int32)
                 noise = ((r * 3 + c * 17) % 7) - 3
                 img[r, c] = np.clip(base + noise, 0, 255).astype(np.uint8)
             else:
@@ -115,7 +116,6 @@ def build_nutrient_overlay(
     overlay[air_mask, 2] = (np.minimum(a * 2, 1.0) * 255).astype(np.uint8)         # B
     overlay[air_mask, 3] = (a * 180).astype(np.uint8)                                # A
 
-    # Build an RGBA surface without requiring convert_alpha (which needs a display)
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
     pygame.surfarray.pixels3d(surf)[:, :, :] = overlay[:, :, :3].transpose(1, 0, 2)
     pygame.surfarray.pixels_alpha(surf)[:, :] = overlay[:, :, 3].transpose(1, 0)
@@ -138,7 +138,7 @@ def build_plant_health_overlay(
       - Green when both nutrients high, yellow middling, red near death
 
     When show_integrity=True:
-      - Green = high integrity, red = about to fall (integrity ≤ 0)
+      - Green = high integrity, red = about to fall (integrity <= 0)
 
     state shape: (N_CHANNELS, H, W)
     """
@@ -152,7 +152,6 @@ def build_plant_health_overlay(
 
     if show_integrity:
         integrity = t[CH_INTEGRITY].numpy().clip(0, 100)
-        # Normalize: 0 → red, 50 → yellow, 100 → green
         norm = integrity / 100.0
         overlay[alive, 0] = (np.maximum(1.0 - norm[alive] * 2, 0.0) * 255).astype(np.uint8)
         overlay[alive, 1] = (np.minimum(norm[alive] * 2, 1.0) * 255).astype(np.uint8)
@@ -173,6 +172,64 @@ def build_plant_health_overlay(
 
     if cell_size != 1:
         surf = pygame.transform.scale(surf, (w * cell_size, h * cell_size))
+    return surf
+
+
+# ---------------------------------------------------------------------------
+# Death flash overlay
+# ---------------------------------------------------------------------------
+
+def build_death_flash_overlay(
+    dying_mask: np.ndarray,
+    cell_size: int,
+) -> pygame.Surface | None:
+    """
+    Build a yellow flash overlay for cells that just died.
+    dying_mask: bool (H, W) — True where a cell died this frame.
+    Returns None if no dying cells.
+    """
+    if not dying_mask.any():
+        return None
+    h, w = dying_mask.shape
+    overlay = np.zeros((h, w, 4), dtype=np.uint8)
+    overlay[dying_mask, 0] = 255   # R
+    overlay[dying_mask, 1] = 230   # G
+    overlay[dying_mask, 2] = 50    # B
+    overlay[dying_mask, 3] = 200   # A
+
+    surf = pygame.Surface((w, h), pygame.SRCALPHA)
+    pygame.surfarray.pixels3d(surf)[:, :, :] = overlay[:, :, :3].transpose(1, 0, 2)
+    pygame.surfarray.pixels_alpha(surf)[:, :] = overlay[:, :, 3].transpose(1, 0)
+
+    if cell_size != 1:
+        surf = pygame.transform.scale(surf, (w * cell_size, h * cell_size))
+    return surf
+
+
+# ---------------------------------------------------------------------------
+# Ghost preview overlay
+# ---------------------------------------------------------------------------
+
+def build_ghost_preview(
+    soil_row: int,
+    col: int,
+    grid_h: int,
+    grid_w: int,
+    cell_size: int,
+) -> pygame.Surface:
+    """
+    Build a translucent 2-cell seed preview at (soil_row, col) and (soil_row-1, col).
+    """
+    surf = pygame.Surface((grid_w * cell_size, grid_h * cell_size), pygame.SRCALPHA)
+    colour = (100, 255, 100, 90)   # translucent green
+    if 0 <= col < grid_w:
+        # Bottom cell (at soil surface)
+        pygame.draw.rect(surf, colour,
+                         (col * cell_size, soil_row * cell_size, cell_size, cell_size))
+        # Top cell (one above)
+        if soil_row > 0:
+            pygame.draw.rect(surf, colour,
+                             (col * cell_size, (soil_row - 1) * cell_size, cell_size, cell_size))
     return surf
 
 
@@ -227,8 +284,8 @@ class SpeciesViewer:
     """
     Manages one NCA species on the simulation grid with environment background.
 
-    The NCA model was trained on GRID_H×GRID_W (64×64) but runs on any size
-    since it uses only local (1×1 conv + 3×3 Sobel) operations.
+    The NCA model was trained on GRID_H*GRID_W (64x64) but runs on any size
+    since it uses only local (1x1 conv + 3x3 Sobel) operations.
     """
 
     def __init__(
@@ -258,6 +315,11 @@ class SpeciesViewer:
         self._step_count: int = 0
         self._dirty: bool = True
 
+        # Death flash: bool mask of cells that died this frame
+        self._dying_flash: np.ndarray = np.zeros((self.grid_h, self.grid_w), dtype=bool)
+        self._flash_frames: int = 0  # frames remaining for flash
+        self._alive_snapshot: torch.Tensor | None = None  # alive mask before death check
+
         self.reset()
 
     # ------------------------------------------------------------------
@@ -280,7 +342,26 @@ class SpeciesViewer:
             seed_positions=seed_positions,
         )
         self._step_count = 0
+        self._dying_flash[:] = False
+        self._flash_frames = 0
         self._dirty = True
+
+    def snapshot_alive(self) -> None:
+        """Save alive mask before death check so we can detect deaths."""
+        if self._state is not None:
+            self._alive_snapshot = (self._state[0, CH_ALPHA] > 0.1).clone()
+
+    def detect_deaths(self) -> None:
+        """Compare current alive mask with snapshot to find newly dead cells."""
+        if self._alive_snapshot is None or self._state is None:
+            return
+        now_alive = self._state[0, CH_ALPHA] > 0.1
+        just_died = self._alive_snapshot & ~now_alive
+        if just_died.any():
+            self._dying_flash = just_died.cpu().numpy()
+            self._flash_frames = 3  # show for 3 frames
+            self._dirty = True
+        self._alive_snapshot = None
 
     def step(self, n: int = 1, nutrients_enabled: bool = False) -> None:
         """Advance the simulation by *n* NCA steps (no grad).
@@ -372,6 +453,16 @@ class SpeciesViewer:
             self._rebuild_surface()
         if self._surface is not None:
             target.blit(self._surface, (x, y))
+
+        # Death flash overlay
+        if self._flash_frames > 0:
+            flash_surf = build_death_flash_overlay(self._dying_flash, self.cell_size)
+            if flash_surf is not None:
+                target.blit(flash_surf, (x, y))
+            self._flash_frames -= 1
+            if self._flash_frames <= 0:
+                self._dying_flash[:] = False
+
         if show_nutrients:
             overlay = build_nutrient_overlay(self.env_state, self.cell_size)
             target.blit(overlay, (x, y))

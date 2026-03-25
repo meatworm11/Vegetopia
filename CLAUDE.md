@@ -61,7 +61,7 @@ Use `python -u` when piping output (e.g. to `tee`), otherwise Python buffers std
 
 ### Training Loop
 
-`training.py`: pool-based strategy (1024 states). Each step: sample batch of 8, replace worst with fresh seed, unroll NCA for 80–128 random steps, backprop with per-parameter gradient normalization. Loss = shape MSE (with optional `ROOT_LOSS_MASK` excluding root cells) + 0.1×cell-type MSE + 0.01×hidden overflow + 2.0×background loss.
+`training.py`: pool-based strategy (1024 states). Each step: sample batch of 8, replace worst with fresh seed, unroll NCA for 80–128 random steps, backprop with per-parameter gradient normalization. Loss = shape MSE (root-masked) + 0.1×cell-type + 0.01×overflow + 2.0×bg + 0.1×stem-colour. Energy-aware mode (`--energy`): runs environment physics during unroll, adds survival bonus. Fine-tuning: `--init-from` loads pretrained weights at LR 5e-4.
 
 ### Environment System
 
@@ -73,7 +73,9 @@ Use `python -u` when piping output (e.g. to `tee`), otherwise Python buffers std
 
 ### Viewer
 
-`viewer.py` + `run_simulation.py`: shared environment with terrain background rendering, plant alpha compositing, and optional nutrient/health overlays. Controls: Space=pause, S=step, R=reset, D=nutrient overlay, E=energy toggle, +/-=speed, LMB=seed, RMB=kill, Q=quit.
+`viewer.py` + `run_simulation.py`: shared environment with terrain background rendering, plant alpha compositing, and optional nutrient/health overlays. Visual features include death flash (yellow wilt), ghost seed preview at cursor, and fullscreen toggle.
+
+Controls: Space=pause, S=step, R=reset, D=overlay, E=energy, G=gravity, F=fullscreen, 1-9=switch species, +/-=speed, LMB=seed, RMB=kill, Q=quit.
 
 ## Two Grid Sizes
 
