@@ -115,6 +115,8 @@ def _layout(cell_size: int) -> tuple[int, int]:
 # Simulation step helper
 # ---------------------------------------------------------------------------
 
+_debug_frame = 0
+
 def _sim_step(
     viewers: list[SpeciesViewer],
     env_state: EnvironmentState,
@@ -123,6 +125,9 @@ def _sim_step(
     gravity_enabled: bool,
 ) -> None:
     """Run one frame of simulation: diffusion, absorption, NCA, death."""
+    global _debug_frame
+    _debug_frame += 1
+
     # Nutrient diffusion (runs every frame regardless of NCA)
     regenerate_sources(env_state)
     diffuse_nutrients(env_state, n_steps=DIFFUSION_SUBSTEPS)
@@ -150,6 +155,15 @@ def _sim_step(
             v.snapshot_alive()
             plant_death_check(v._state)
             v.detect_deaths()
+
+    # Debug: print alive count every 30 frames (~1 second)
+    if _debug_frame % 30 == 0:
+        for v in viewers:
+            alive = int((v._state[0, 3] > 0.1).sum().item())
+            cap_str = ' CAP' if alive >= 800 else ''
+            print(f'[frame {_debug_frame}] {v.name}: alive={alive}{cap_str}'
+                  f'  energy={"ON" if nutrients_enabled else "OFF"}'
+                  f'  gravity={"ON" if gravity_enabled else "OFF"}')
 
 
 # ---------------------------------------------------------------------------

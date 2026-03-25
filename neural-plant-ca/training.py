@@ -80,13 +80,13 @@ _STEM_BROWN = torch.tensor([0.45, 0.30, 0.15]).view(3, 1, 1)
 def _compute_loss(
     output: torch.Tensor,
     target: torch.Tensor,
-    survival_bonus: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    energy_health: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Return (total_loss, shape_loss, type_loss, overflow_loss, bg_loss, stem_loss).
+    Return (total_loss, shape_loss, type_loss, overflow_loss, bg_loss, stem_loss, energy_loss).
 
     target shape: (N_CHANNELS, H, W) — broadcast over batch automatically.
-    survival_bonus: if True, add -0.001 * alive_count to encourage keeping cells alive.
+    energy_health: if True, penalize alive cells with nutrients below 0.5.
     """
     tgt = target.unsqueeze(0)   # (1, C, H, W) — broadcasts to batch
 
@@ -127,12 +127,20 @@ def _compute_loss(
 
     total = shape_loss + 0.1 * type_loss + 0.01 * overflow + 2.0 * bg_loss + 0.1 * stem_loss
 
-    # --- Survival bonus ---
-    if survival_bonus:
-        n_alive = (output[:, CH_ALPHA:CH_ALPHA + 1] > 0.1).float().sum()
-        total = total + (-0.001 * n_alive)
+    # --- Energy health loss ---
+    # Penalize alive cells with nutrients below 0.5.
+    # Forces the model to grow roots (earth supply) and leaves (air supply).
+    energy_loss = torch.tensor(0.0, device=output.device)
+    if energy_health:
+        earth = output[:, CH_EARTH:CH_EARTH + 1]   # (B, 1, H, W)
+        air   = output[:, CH_AIR:CH_AIR + 1]       # (B, 1, H, W)
+        n_alive = alive_mask.sum().clamp(min=1)
+        earth_deficit = (0.5 - earth).clamp(min=0) * alive_mask
+        air_deficit   = (0.5 - air).clamp(min=0) * alive_mask
+        energy_loss = (earth_deficit.sum() + air_deficit.sum()) / n_alive
+        total = total + 0.5 * energy_loss
 
-    return total, shape_loss, type_loss, overflow, bg_loss, stem_loss
+    return total, shape_loss, type_loss, overflow, bg_loss, stem_loss, energy_loss
 
 
 def _per_sample_loss(states: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -257,7 +265,7 @@ def train(
 
     header = (
         f"{'Step':>6}  {'Ph':>2}  {'Loss':>9}  {'Shape':>9}  {'Type':>7}  "
-        f"{'OFlow':>7}  {'BgLoss':>7}  {'Stem':>7}  {'Alive':>5}  {'Elapsed':>7}  ETA"
+        f"{'OFlow':>7}  {'BgLoss':>7}  {'Stem':>7}  {'Energy':>7}  {'Alive':>5}  {'Elapsed':>7}  ETA"
     )
     print(header)
     print("-" * len(header))
@@ -317,9 +325,9 @@ def train(
                         plant_death_check(sample)
 
         # --- Loss ---------------------------------------------------------------
-        # Survival bonus always active when energy flag is set (all curriculum phases)
-        total, shape_l, type_l, overflow_l, bg_l, stem_l = _compute_loss(
-            x, target, survival_bonus=energy,
+        # Energy health loss active when energy flag is set (all curriculum phases)
+        total, shape_l, type_l, overflow_l, bg_l, stem_l, energy_l = _compute_loss(
+            x, target, energy_health=energy,
         )
 
         # --- Backward + gradient normalization ----------------------------------
@@ -347,6 +355,7 @@ def train(
                 f"{overflow_l.item():>7.4f}  "
                 f"{bg_l.item():>7.5f}  "
                 f"{stem_l.item():>7.5f}  "
+                f"{energy_l.item():>7.5f}  "
                 f"{n_alive:>5}  "
                 f"{elapsed:>6.0f}s  {eta:.0f}s"
             )

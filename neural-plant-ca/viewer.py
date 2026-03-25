@@ -26,7 +26,7 @@ import torch
 from config import (
     SIM_GRID_H, SIM_GRID_W, CELL_RENDER_SIZE, N_CHANNELS,
     CH_RGB, CH_ALPHA, CH_HIDDEN, CH_SPECIES_ID, CH_EARTH, CH_AIR,
-    CH_CELL_TYPE, CH_INTEGRITY, CELL_FIRE_RATE, MAX_CELLS,
+    CH_CELL_TYPE, CH_INTEGRITY, CELL_FIRE_RATE,
     ENV_EMPTY, ENV_SOIL, ENV_ROCK, ENV_SUN,
 )
 from environment import EnvironmentState, NUTRIENT_EARTH, NUTRIENT_AIR
@@ -364,24 +364,14 @@ class SpeciesViewer:
         self._alive_snapshot = None
 
     def step(self, n: int = 1, nutrients_enabled: bool = False) -> None:
-        """Advance the simulation by *n* NCA steps (no grad).
-
-        Growth cap: if alive cells exceed MAX_CELLS after any step,
-        revert newly spawned cells (alpha went from 0 to >0) back to zero.
-        """
+        """Advance the simulation by *n* NCA steps (no grad)."""
         with torch.no_grad():
             for _ in range(n):
-                was_alive = self._state[0, CH_ALPHA] > 0.1
                 self._state = self.model(
                     self._state,
                     fire_rate=CELL_FIRE_RATE,
                     nutrients_enabled=nutrients_enabled,
                 )
-                now_alive = self._state[0, CH_ALPHA] > 0.1
-                if int(now_alive.sum().item()) > MAX_CELLS:
-                    new_cells = now_alive & ~was_alive
-                    if new_cells.any():
-                        self._state[0, :, new_cells] = 0.0
         self._step_count += n
         self._dirty = True
 
