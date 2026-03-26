@@ -63,7 +63,7 @@ N_TRAINING_STEPS   = 10000
 # Energy system (plant nutrient absorption / dissipation / death)
 # ---------------------------------------------------------------------------
 ABSORPTION_RATE       = 0.05     # nutrients absorbed per step by root/leaf cells
-DISSIPATION_RATE      = 0.002    # nutrients lost per step per alive cell (maintenance)
+DISSIPATION_RATE      = 0.005    # nutrients lost per step per alive cell (maintenance)
 DEATH_THRESHOLD       = 0.01     # cell dies based on cell-type-specific rules
 NUTRIENTS_ENABLED     = False    # False = phase-1 (channels 4-5 clamped to 1.0)
 ROOT_LOSS_MASK        = True     # exclude root cells from shape loss during training
@@ -88,10 +88,13 @@ MAX_CELLS             = 800    # max alive cells per species; new cells reverted
 
 # ---------------------------------------------------------------------------
 # Seed positions  (row, col) — index 0 is the bottom cell (future root zone)
+# Placed 1 row above soil surface so roots grow immediately into soil.
+# Soil starts at GRID_H - GRID_H // 5 (row 52 for 64x64).
 # ---------------------------------------------------------------------------
+_SOIL_TOP = GRID_H - GRID_H // 5
 SEED_POSITIONS = [
-    (GRID_H - GRID_H // 4,     GRID_W // 2),   # (48, 32) — root zone
-    (GRID_H - GRID_H // 4 - 1, GRID_W // 2),   # (47, 32) — stem zone
+    (_SOIL_TOP - 1, GRID_W // 2),   # (51, 32) — root zone, 1 row above soil
+    (_SOIL_TOP - 2, GRID_W // 2),   # (50, 32) — stem zone
 ]
 
 # ---------------------------------------------------------------------------

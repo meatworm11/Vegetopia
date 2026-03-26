@@ -119,14 +119,16 @@ def _compute_loss(
         total = total + 0.5 * energy_loss
 
     # --- Root presence reward ---
-    # Direct differentiable signal: alive cells with cell_type ≈ 0.25 in soil
-    # rows are valuable.  Uses soft proximity to 0.25 so gradients flow through
-    # cell_type channel.
+    # Direct differentiable signal: alive cells with cell_type ≈ 0.25 in the
+    # root zone are valuable.  Zone = soil rows + 4 rows above soil (transition
+    # zone where target roots appear).  Uses soft proximity to 0.25 so gradients
+    # flow through cell_type channel.
     root_reward = torch.tensor(0.0, device=output.device)
     if energy_health and soil_row > 0:
         EXPECTED_ROOTS = 20.0
-        ctype_soil = output[:, CH_CELL_TYPE:CH_CELL_TYPE + 1, soil_row:, :]  # (B,1,soil_H,W)
-        alive_soil = alive_mask[:, :, soil_row:, :]                           # (B,1,soil_H,W)
+        root_zone_top = max(0, soil_row - 4)
+        ctype_soil = output[:, CH_CELL_TYPE:CH_CELL_TYPE + 1, root_zone_top:, :]  # (B,1,zone_H,W)
+        alive_soil = alive_mask[:, :, root_zone_top:, :]                           # (B,1,zone_H,W)
         # Soft root score: 1.0 when cell_type == 0.25, falls off away from it
         root_score = (1.0 - ((ctype_soil - 0.25) / 0.15).pow(2)).clamp(min=0)
         root_count = (root_score * alive_soil).sum() / max(output.shape[0], 1)
