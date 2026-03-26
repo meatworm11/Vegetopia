@@ -320,6 +320,10 @@ def train(
                     print(f"  [nutrient debug] alive={int(alive.sum())}  "
                           f"earth: min={earth_alive.min():.4f} max={earth_alive.max():.4f} mean={earth_alive.mean():.4f}  "
                           f"air: min={air_alive.min():.4f} max={air_alive.max():.4f} mean={air_alive.mean():.4f}")
+                    ctype = s[CH_CELL_TYPE]
+                    is_root = alive & ((ctype - 0.25).abs() < 0.1)
+                    roots_in_soil = int(is_root[soil_row:].sum())
+                    print(f"  [root debug] root_cells={int(is_root.sum())} in_soil={roots_in_soil}")
                 else:
                     print(f"  [nutrient debug] no alive cells")
 
