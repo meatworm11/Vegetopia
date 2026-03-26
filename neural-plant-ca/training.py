@@ -237,6 +237,7 @@ def train(
     if energy:
         print("Sources regeneration: DISABLED (finite nutrient pool per rollout)")
         print("NCA nutrient override: DISABLED (channels 4-5 preserved from input)")
+        print("Rollout curriculum: steps 1-1499 → 48-80, steps 1500+ → 80-128")
 
     t0           = time.time()
     loss_history = []
@@ -258,7 +259,14 @@ def train(
             env_state.nutrient_grid.copy_(env_nutrient_snapshot)
 
         # --- Unroll NCA ---------------------------------------------------------
-        n_nca = int(rng.integers(TRAIN_STEPS_RANGE[0], TRAIN_STEPS_RANGE[1] + 1))
+        # Rollout curriculum: shorter unrolls early on reduce nutrient drain per
+        # pool visit, giving a from-scratch model time to learn basic growth
+        # before facing full-length nutrient pressure.
+        if energy and step < 1500:
+            lo, hi = 48, 80
+        else:
+            lo, hi = TRAIN_STEPS_RANGE
+        n_nca = int(rng.integers(lo, hi + 1))
         x     = batch
         for _ in range(n_nca):
             x = model(x, fire_rate=CELL_FIRE_RATE, nutrients_enabled=energy)
