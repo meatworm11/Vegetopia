@@ -57,12 +57,14 @@ def _compute_loss(
     output: torch.Tensor,
     target: torch.Tensor,
     energy_health: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    soil_row: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Return (total_loss, shape_loss, type_loss, overflow_loss, bg_loss, stem_loss, energy_loss).
+    Return (total_loss, shape_loss, type_loss, overflow_loss, bg_loss, stem_loss, energy_loss, root_reward).
 
     target shape: (N_CHANNELS, H, W) — broadcast over batch automatically.
-    energy_health: if True, penalize alive cells with nutrients below 0.5.
+    energy_health: if True, penalize alive cells with nutrients below 0.85.
+    soil_row: first soil row index — used for root presence reward.
     """
     tgt = target.unsqueeze(0)   # (1, C, H, W) — broadcasts to batch
 
@@ -116,7 +118,22 @@ def _compute_loss(
         energy_loss = (earth_deficit.sum() + air_deficit.sum()) / n_alive
         total = total + 0.5 * energy_loss
 
-    return total, shape_loss, type_loss, overflow, bg_loss, stem_loss, energy_loss
+    # --- Root presence reward ---
+    # Direct differentiable signal: alive cells with cell_type ≈ 0.25 in soil
+    # rows are valuable.  Uses soft proximity to 0.25 so gradients flow through
+    # cell_type channel.
+    root_reward = torch.tensor(0.0, device=output.device)
+    if energy_health and soil_row > 0:
+        EXPECTED_ROOTS = 20.0
+        ctype_soil = output[:, CH_CELL_TYPE:CH_CELL_TYPE + 1, soil_row:, :]  # (B,1,soil_H,W)
+        alive_soil = alive_mask[:, :, soil_row:, :]                           # (B,1,soil_H,W)
+        # Soft root score: 1.0 when cell_type == 0.25, falls off away from it
+        root_score = (1.0 - ((ctype_soil - 0.25) / 0.15).pow(2)).clamp(min=0)
+        root_count = (root_score * alive_soil).sum() / max(output.shape[0], 1)
+        root_reward = -0.5 * (root_count / EXPECTED_ROOTS).clamp(max=1.0)
+        total = total + root_reward
+
+    return total, shape_loss, type_loss, overflow, bg_loss, stem_loss, energy_loss, root_reward
 
 
 def _per_sample_loss(states: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -201,6 +218,7 @@ def train(
 
     # --- Energy-aware training environment ---
     env_state = None
+    soil_row  = 0      # 0 = no soil info → root reward disabled
     if energy:
         from environment import (
             create_environment, EnvironmentState,
@@ -218,7 +236,8 @@ def train(
             regenerate_sources(env_state)
             diffuse_nutrients(env_state, n_steps=5)
         env_nutrient_snapshot = env_state.nutrient_grid.clone()
-        print("  done.")
+        soil_row = GRID_H - GRID_H // 5   # first soil row (matches create_environment)
+        print(f"  done.  soil_row={soil_row}")
 
     # Pool lives on CPU to avoid VRAM pressure; batches are moved to device per step.
     seed_cpu = make_seed(1, device=torch.device('cpu'))            # (1, C, H, W)
@@ -229,7 +248,7 @@ def train(
 
     header = (
         f"{'Step':>6}  {'Loss':>9}  {'Shape':>9}  {'Type':>7}  "
-        f"{'OFlow':>7}  {'BgLoss':>7}  {'Stem':>7}  {'Energy':>7}  {'Alive':>5}  {'Elapsed':>7}  ETA"
+        f"{'OFlow':>7}  {'BgLoss':>7}  {'Stem':>7}  {'Energy':>7}  {'Root':>7}  {'Alive':>5}  {'Elapsed':>7}  ETA"
     )
     print(header)
     print("-" * len(header))
@@ -237,7 +256,8 @@ def train(
     if energy:
         print("Sources regeneration: DISABLED (finite nutrient pool per rollout)")
         print("NCA nutrient override: DISABLED (channels 4-5 preserved from input)")
-        print("Rollout curriculum: steps 1-1499 → 48-80, steps 1500+ → 80-128")
+        print("Rollout curriculum: max = min(40 + step//20, 128)")
+        print("Death immunity: first 10 NCA steps of each rollout")
 
     t0           = time.time()
     loss_history = []
@@ -259,16 +279,17 @@ def train(
             env_state.nutrient_grid.copy_(env_nutrient_snapshot)
 
         # --- Unroll NCA ---------------------------------------------------------
-        # Rollout curriculum: shorter unrolls early on reduce nutrient drain per
-        # pool visit, giving a from-scratch model time to learn basic growth
-        # before facing full-length nutrient pressure.
-        if energy and step < 1500:
-            lo, hi = 48, 80
+        # Rollout curriculum: ramp max rollout from 40 up to 128 over training.
+        # Shorter early rollouts reduce nutrient drain per pool visit, giving
+        # the model time to learn basic growth before nutrient pressure.
+        if energy:
+            rollout_max = min(40 + step // 20, TRAIN_STEPS_RANGE[1])
+            rollout_min = min(TRAIN_STEPS_RANGE[0], rollout_max)
         else:
-            lo, hi = TRAIN_STEPS_RANGE
-        n_nca = int(rng.integers(lo, hi + 1))
+            rollout_min, rollout_max = TRAIN_STEPS_RANGE
+        n_nca = int(rng.integers(rollout_min, rollout_max + 1))
         x     = batch
-        for _ in range(n_nca):
+        for nca_step in range(n_nca):
             x = model(x, fire_rate=CELL_FIRE_RATE, nutrients_enabled=energy)
 
             # Energy-aware: run environment physics after each NCA step.
@@ -281,7 +302,10 @@ def train(
                         plant_absorb_nutrients(sample, env_state)
                         transport_nutrients(sample, n_steps=NUTRIENT_TRANSPORT_STEPS)
                         plant_dissipate_energy(sample)
-                        plant_death_check(sample)
+                        # Death immunity for the first 10 NCA steps — let the
+                        # plant establish before it can die.
+                        if nca_step >= 10:
+                            plant_death_check(sample)
 
         # --- Debug: nutrient levels after unroll -----------------------------------
         if energy and step % 100 == 0:
@@ -299,8 +323,8 @@ def train(
 
         # --- Loss ---------------------------------------------------------------
         # Energy health loss active when energy flag is set (all curriculum phases)
-        total, shape_l, type_l, overflow_l, bg_l, stem_l, energy_l = _compute_loss(
-            x, target, energy_health=energy,
+        total, shape_l, type_l, overflow_l, bg_l, stem_l, energy_l, root_r = _compute_loss(
+            x, target, energy_health=energy, soil_row=soil_row,
         )
 
         # --- Backward + gradient normalization ----------------------------------
@@ -329,6 +353,7 @@ def train(
                 f"{bg_l.item():>7.5f}  "
                 f"{stem_l.item():>7.5f}  "
                 f"{energy_l.item():>7.5f}  "
+                f"{root_r.item():>7.4f}  "
                 f"{n_alive:>5}  "
                 f"{elapsed:>6.0f}s  {eta:.0f}s"
             )
